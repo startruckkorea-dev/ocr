@@ -61,16 +61,29 @@
   // ── 공통 도우미 ─────────────────────────────────────────────────────────────
   // 전각 → 반각, 흔한 OCR 혼동 정리(숫자 문맥의 O/o → 0, l/I → 1 은 숫자 사이에서만)
   function norm(s) {
-    return String(s || "")
+    let t = String(s || "")
       .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
       .replace(/\u3000/g, " ")
       .replace(/[：﹕]/g, ":")
       .replace(/(?<=\d)[Oo](?=\d)/g, "0")
       .replace(/(?<=\d)[lI|](?=\d)/g, "1")
       .replace(/[ \t]+/g, " ")
+      .replace(/※|\u203B/g, "*")
+      // 「10, 100」 「35. 000」 — 천 단위 구분 뒤에 끼어든 공백
+      .replace(/(\d{1,3})[,.]\s(\d{3})(?!\d)/g, "$1,$2")
       .trim();
+    // Tesseract 는 한글 음절마다 띄어 읽는 일이 잦다(「메 가 커 피 오 리 역 점」). 한 글자 한글이 셋 이상 이어지면 붙인다.
+    t = t.replace(/(?:^|(?<= ))(?:[가-힣] ){2,}[가-힣](?= |$)/g, (m) => m.replace(/ /g, ""));
+    for (const [re, to] of LABEL_FIX) t = t.replace(re, to);
+    return t;
   }
-  const squash = (s) => s.replace(/\s+/g, "");               // 라벨 비교용(「부 가 세」 → 「부가세」)
+  const squash = (s) => s.replace(/\s+/g, "");
+  // 감열지 한글 라벨의 흔한 오인식(실제 영수증 8장에서 확인) — 「승인」 → 슴인 · 「번호」 → 번오/번요/번모 ·
+  // 「금액」 → 금맥/글액 · 「합계」 → 합게 · 「가액」 → 가맥 · 「물품」 → 불품/룰품 · 「발행」 → 발앵
+  const LABEL_FIX = [
+    [/[승슴스]\s?[인이]\s?(?=번|일|금|내|정)/g, "승인"], [/번\s?[호오요모]\b|번\s?[호오요모](?=\s|:|\]|$)/g, "번호"],
+    [/금\s?[액맥]|글\s?액/g, "금액"], [/합\s?[게계](?!좌)/g, "합계"], [/가\s?맥/g, "가액"], [/[불룰]\s?품/g, "물품"], [/발\s?앵/g, "발행"],
+  ];               // 라벨 비교용(「부 가 세」 → 「부가세」)
   // 금액 — 「21,400」 「21.400」(쉼표가 점으로 읽힘) 「21400원」 「₩21,400」 「-1,000」
   const MONEY_RE = /-?\s?[₩\\]?\s?\d{1,3}(?:[,.]\d{3})+(?!\d)|-?\s?[₩\\]?\s?\d{1,9}(?=\s*원?\s*$|\s*원)/g;
   function toMoney(tok) {
@@ -87,8 +100,10 @@
   }
   const fmtMoney = (n) => (n == null || isNaN(n) ? "" : Number(n).toLocaleString("ko-KR"));
   // 날짜 · 시각 — 2026-09-22 14:35:12 · 2026.09.22 · 26/09/22 · 2026년 9월 22일
-  const DATE_RE = /(20\d{2}|\b\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s*일?(?:\s*\(?[월화수목금토일]\)?)?(?:\s*(\d{1,2})\s*[:시]\s*(\d{2})(?:\s*[:분]\s*(\d{2}))?)?/;
+  const DATE_RE = /(20\d{2}|\b\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s*일?(?:\s*\([^)]{1,3}\)|\s*[월화수목금토일])?(?:\s*(오전|오후|AM|PM)?\s*(\d{1,2})\s*[:시]\s*(\d{2})(?:\s*[:분]\s*(\d{2}))?)?/i;
   function parseDate(text) {
+    // 「20260910 12:06:33」 처럼 붙은 날짜
+    text = String(text).replace(/\b(20\d{2})(\d{2})(\d{2})(?=\s+\d{1,2}:\d{2})/, "$1-$2-$3");
     const m = String(text).match(DATE_RE);
     if (!m) return null;
     let y = Number(m[1]); if (y < 100) y += 2000;
@@ -96,7 +111,10 @@
     if (mo < 1 || mo > 12 || d < 1 || d > 31 || y < 2000 || y > 2099) return null;
     const p = (n) => String(n).padStart(2, "0");
     let v = `${y}-${p(mo)}-${p(d)}`;
-    if (m[4] != null && Number(m[4]) < 24 && Number(m[5]) < 60) v += ` ${p(m[4])}:${m[5]}${m[6] != null ? ":" + m[6] : ""}`;
+    let hh = m[5] != null ? Number(m[5]) : null;
+    if (hh != null && /오후|PM/i.test(m[4] || "") && hh < 12) hh += 12;
+    if (hh != null && /오전|AM/i.test(m[4] || "") && hh === 12) hh = 0;
+    if (hh != null && hh < 24 && Number(m[6]) < 60) v += ` ${p(hh)}:${m[6]}${m[7] != null ? ":" + m[7] : ""}`;
     return v;
   }
   const afterColon = (t) => { const i = t.indexOf(":"); return i >= 0 ? t.slice(i + 1).trim() : ""; };
@@ -222,7 +240,10 @@
           case "txnDate": case "approvalDate": { const d = parseDate(l.t); if (d) set(key, d, l, "label"); break; }
           case "cardNo": { const m = l.t.match(/[\d*xX]{4}[-\s]?[\d*xX]{2,4}[-\s]?[\d*xX]{2,4}[-\s]?[\d*xX]{2,4}/); if (m) set(key, groupCard(m[0]), l, "label"); break; }
           case "installment": { if (/일시불|일시|00\s*개월|^0$/.test(rest) || /일시불/.test(l.t)) set(key, "일시불", l, "label"); else { const m = l.t.match(/(\d{1,2})\s*개?월?/g); const n = m ? Number(String(m[m.length - 1]).replace(/\D/g, "")) : null; if (n != null) set(key, n === 0 ? "일시불" : `${n}개월`, l, "label"); } break; }
-          case "approvalNo": case "merchantNo": case "cashReceiptNo": { const m = l.t.match(/(\d[\d\s-]{4,18}\d)(?!.*\d)/); if (m) set(key, m[1].replace(/\s/g, ""), l, "label"); break; }
+          case "approvalNo": case "merchantNo": case "cashReceiptNo": {
+            const after = l.t.slice(l.t.search(new RegExp(hit.lb.split("").join("\\s*"))) + 1).replace(/\((?=\d{7}\b)/, "0");
+            const m = after.match(/(?<![\d,])(\d[\d-]{5,14}\d)(?![\d,])/);
+            if (m) set(key, m[1].replace(/-/g, ""), l, "label"); break; }
           case "receiptNo": { const m = rest.match(/[A-Za-z0-9][\w\-/]{3,}/); if (m) set(key, m[0], l, "label"); break; }
           case "pos": { const m = l.t.match(/(?:POS|포스)\s*:?\s*([\w-]+)/i); const c = l.t.match(/(?:계산원|캐셔|담당)\s*:?\s*([가-힣\w]+)/); if (m || c) set(key, [m && m[1], c && c[1]].filter(Boolean).join(" · "), l, "label"); break; }
           case "cardIssuer": { if (rest) set(key, rest.replace(/\((신용|체크|기프트|선불|직불)\)/, "").trim() || rest, l, "label"); const ty = l.t.match(/신용|체크|기프트|선불|직불/); if (ty) set("cardType", ty[0], l, "label"); break; }
@@ -233,9 +254,28 @@
       }
     }
 
+    // 1-2) 라벨이 한 줄, 값이 다음 줄에 칸 맞춰 있는 표
+    const HEAD = [["supply", /과세물품|공급가/], ["vat", /부가세|세액/], ["taxFree", /면세/], ["total", /합계|총액|결제금액/], ["discount", /할인/]];
+    for (let k = 0; k + 1 < lines.length; k++) {
+      const l = lines[k], nx = lines[k + 1];
+      if (/\d{2,}/.test(l.t)) continue;
+      const hits = [];
+      for (const w of l.t.split(/\s+/).filter(Boolean)) { const h = HEAD.find(([, re]) => re.test(w.replace(/\s/g, ""))); if (h) hits.push(h[0]); }
+      if (hits.length < 2) continue;
+      const vals = (nx.t.match(MONEY_RE) || []).map(toMoney);
+      if (vals.length !== hits.length) continue;
+      hits.forEach((key, j) => { if (!F[key]) set(key, fmtMoney(vals[j]), nx, "label"); });
+    }
+
     // 2) 값 모양으로 찾기 — 라벨이 깨졌을 때
     for (const l of lines) {
-      if (!F.bizNo) { const m = l.t.match(/\b(\d{3})-(\d{2})-(\d{5})\b/); if (m) set("bizNo", `${m[1]}-${m[2]}-${m[3]}`, l, "pattern"); }
+      if (!F.bizNo) { const m = l.t.match(/\b(\d{3})\s?-\s?(\d{2})\s?-\s?(\d{5})\b/); if (m) set("bizNo", `${m[1]}-${m[2]}-${m[3]}`, l, "pattern"); }
+      // 하이픈 없는 10자리 — 검증번호가 맞을 때만(전화 · 승인번호 오인 방지)
+      if (!F.bizNo) { for (const m of l.t.matchAll(/(?<![\d-])(\d{10})(?![\d-])/g)) { if (bizNoValid(m[1])) { set("bizNo", `${m[1].slice(0, 3)}-${m[1].slice(3, 5)}-${m[1].slice(5)}`, l, "pattern"); break; } } }
+      // 라벨 없는 승인번호 — 「[07404100] KICC로 제출」 처럼 8자리 숫자 옆에 VAN 이름
+      if (!F.approvalNo) { const m = l.t.match(/\[?\b(\d{8})\b\]?\s*.*\b(KICC|KIS|NICE|KSNET|KOVAN|SMARTRO|JTNET|FDIK|KCP|DAOU|SPC|KFTC)\b/i) || l.t.match(/\b(KICC|KIS|NICE|KSNET|KOVAN|SMARTRO|JTNET|FDIK|KCP|DAOU|SPC|KFTC)\b.*?\b(\d{8})\b/i);
+        if (m) set("approvalNo", /^\d{8}$/.test(m[1]) ? m[1] : m[2], l, "pattern"); }
+      if (!F.approvalNo) { const m = l.t.match(/^\s*\[\s*(\d{8})\s*\]/); if (m && !/\d{4}[-./]\d{2}/.test(l.t)) set("approvalNo", m[1], l, "pattern"); }
       if (!F.phone) { const m = l.t.match(/\b(0\d{1,2})-(\d{3,4})-(\d{4})\b/); if (m && !/카드|계좌/.test(l.t)) set("phone", `${m[1]}-${m[2]}-${m[3]}`, l, "pattern"); }
       if (!F.cardNo) { const m = l.t.match(/\b\d{4}[-\s]?[\d*]{2,4}\*[\d*]*[-\s]?[\d*]{4}[-\s]?[\d*]{3,4}\b/); if (m) set("cardNo", groupCard(m[0]), l, "pattern"); }
       if (!F.address && /(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)[가-힣]*\s/.test(l.t) && /(구|군|시)\s/.test(l.t) && /(로|길|동|읍|면)\s*\d|(로|길)\b/.test(l.t)) set("address", l.t.replace(/^주소\s*:?\s*/, ""), l, "pattern");
@@ -243,15 +283,36 @@
       if (!F.cardType) { const ty = l.t.match(/\((신용|체크)\)|(신용|체크)\s*카드/); if (ty) set("cardType", ty[1] || ty[2], l, "pattern"); }
     }
     // 날짜 — 라벨이 없으면 승인과 무관한 첫 날짜가 거래일시
-    const dateLines = lines.map((l) => ({ l, d: parseDate(l.t) })).filter((x) => x.d);
-    if (!F.txnDate) { const x = dateLines.find((x) => !/승인/.test(x.l.sq)) || dateLines[0]; if (x) set("txnDate", x.d, x.l, "pattern"); }
+    // 날짜만 있는 줄 다음 줄이 시각으로 시작하면 이어 붙인다(「판매시간: 2026-08-26」 / 「11:38:23」)
+    const dateLines = lines.map((l, k) => {
+      let d = parseDate(l.t);
+      if (d && d.length === 10) { const nx = lines[k + 1]; const tm = nx && nx.t.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/); if (tm && !parseDate(nx.t)) d += ` ${tm[1].padStart(2, "0")}:${tm[2]}${tm[3] ? ":" + tm[3] : ""}`; }
+      return { l, d };
+    }).filter((x) => x.d);
+    const withTime = dateLines.filter((x) => x.d.length > 10);
+    if (F.txnDate && F.txnDate.value.length === 10) { const x = withTime.find((x) => x.d.startsWith(F.txnDate.value)); if (x) F.txnDate = { ...F.txnDate, value: x.d }; }
+    if (!F.txnDate) { const x = withTime.find((x) => !/승인/.test(x.l.sq)) || dateLines.find((x) => !/승인/.test(x.l.sq)) || dateLines[0]; if (x) set("txnDate", x.d, x.l, "pattern"); }
     if (!F.approvalDate && (F.approvalNo || F.cardNo)) { const x = dateLines.find((x) => /승인/.test(x.l.sq)) || dateLines[dateLines.length - 1]; if (x && x.l.i !== (F.txnDate && F.txnDate.line)) set("approvalDate", x.d, x.l, "pattern"); }
+    if (F.txnDate) {
+      const dd = F.txnDate.value.slice(5, 10).replace("-", "");
+      for (const l of lines) { const m = l.t.match(/\b(20\d{2})(\d{4})(?=[-_\d])/); if (m && m[2] === dd && m[1] !== F.txnDate.value.slice(0, 4)) { F.txnDate = { ...F.txnDate, value: m[1] + F.txnDate.value.slice(4), how: "pattern" }; break; } }
+    }
     // 영수증번호 — 라벨이 깨졌어도 「날짜숫자-..-....」 모양이면
     if (!F.receiptNo) { const l = lines.find((l) => /\b20\d{6}[-_]\d{1,4}[-_]\d{2,6}\b/.test(l.t)); if (l) set("receiptNo", l.t.match(/\b20\d{6}[-_]\d{1,4}[-_]\d{2,6}\b/)[0], l, "pattern"); }
     // 상호 — 라벨이 없으면 맨 위쪽에서 제목(영수증 · 매출전표 등)이 아닌 첫 한글 줄
     if (!F.storeName) {
-      const l = lines.slice(0, 6).find((l) => /[가-힣]{2,}/.test(l.t) && !/영\s*수\s*증|매출\s*전표|전표|RECEIPT|고객용|카드|사업자|주소|TEL|전화|\d{3}-\d{2}-\d{5}/i.test(l.t) && !/^\[.*\]$/.test(l.t));
-      if (l) set("storeName", l.t.replace(/^상호\s*:?\s*/, ""), l, "pattern");
+      // 위쪽 줄 중에서 — 지점 이름처럼 보이는 줄(「…점」 「(…점)」 「…지점 · 매장」)을 먼저. 체인 표어(「재미있는 일상 플랫폼」)나
+      // 제목 줄보다 「GS25서울스퀘어점」 같은 줄이 상호다(실제 영수증에서 확인). 없으면 첫 한글 줄.
+      // 상호 뒤에 사업자번호 · 대표자 · 전화가 한 줄로 붙는 영수증이 많다 — 줄을 버리지 않고 앞부분만 쓴다
+      const storePart = (t) => t.replace(/^(\[영수증\]|상호)\s*:?\s*/, "").split(/\s*\/\s*|\s{2,}|\s(?=\d{3}-?\d{2}-?\d{5}\b)|\s(?=0\d{1,2}-\d{3,4}-\d{4})|\s(?=TEL)/i)[0].trim();
+      const cand = lines.slice(0, 8).filter((l) => /[가-힣]{2,}/.test(storePart(l.t)) && !/영\s*수\s*증|매출\s*전표|전표|RECEIPT|고객용|교환권|카드|사업.{0,2}번|주소|^TEL|전화|상품명|품명|수량|단가|금액|합계|대표|하나\s*\(|구외환/i.test(storePart(l.t))
+        && !/(대로|[가-힣]로\s?\d|[가-힣]길\s?\d|\s[가-힣]{1,3}구\s)/.test(storePart(l.t)) && !/^\[.*\]$/.test(l.t)
+        // 깨진 줄 거르기 — 글자의 절반 이상이 한글(또는 「GS25서울스퀘어점」 같은 영문 체인 + 지점)이고, 문장부호로 시작하지 않을 것
+        && !/^[^가-힣A-Za-z0-9(]/.test(storePart(l.t)) && !/공급가/.test(l.t)
+        && ((storePart(l.t).match(/[가-힣]/g) || []).length / Math.max(1, storePart(l.t).replace(/\s/g, "").length) >= 0.5 || /^[A-Z]{2,}\d*[가-힣]+점/.test(storePart(l.t))));
+      const branch = (t) => /[가-힣A-Za-z0-9)]\s*(점|지점|본점|매장)(\)|\s|\/|$)/.test(t);
+      const l = cand.find((l) => branch(storePart(l.t))) || cand[0];
+      if (l) set("storeName", storePart(l.t), l, "pattern");
     }
 
     // 3) 품목 — 머리줄(상품명 · 품명 · 메뉴) 다음부터 합계류 줄 전까지
@@ -273,6 +334,28 @@
       if (F.cardNo || F.approvalNo || F.cardIssuer) set("payMethod", "카드", null, "derived");
       else if (F.accountNo || lines.some((l) => /계좌이체|무통장/.test(l.sq))) set("payMethod", "계좌이체", null, "derived");
       else if (F.cashReceiptNo || F.received || lines.some((l) => /현금/.test(l.sq))) set("payMethod", "현금", null, "derived");
+    }
+
+    // 4-2) 금액 삼각 측량 — 영수증의 모든 금액에서 s + v = t, v ≈ s × 10% 인 세 값을 찾는다.
+    //      라벨로 찾은 값이 이 관계를 이미 만족하면 그대로 두고, 아니면 빈 칸 · 틀린 칸을 이 값으로 채운다(「모양으로 찾음」).
+    {
+      const amts = [];
+      lines.forEach((l) => { for (const m of (l.t.match(MONEY_RE) || [])) { const v = toMoney(m); if (v >= 10 && v < 1e9) amts.push({ v, l }); } });
+      const uniq = [...new Map(amts.map((a) => [a.v, a])).values()];
+      let best = null;
+      for (const a of uniq) for (const b of uniq) {
+        if (b.v >= a.v || b.v === 0) continue;
+        const need = a.v + b.v, t = uniq.find((x) => Math.abs(x.v - need) <= 1);
+        if (!t || Math.abs(b.v - Math.round(a.v * 0.1)) > Math.max(2, a.v * 0.003)) continue;
+        const cnt = amts.filter((x) => x.v === t.v).length;               // 합계는 영수증에 여러 번 찍힌다
+        if (!best || cnt > best.cnt || (cnt === best.cnt && t.v > best.t.v)) best = { s: a, v: b, t, cnt };
+      }
+      const cur = (k) => (F[k] ? toMoney(F[k].value) : null);
+      const okNow = cur("supply") != null && cur("vat") != null && cur("total") != null && Math.abs(cur("supply") + cur("vat") + (cur("taxFree") || 0) + (cur("serviceFee") || 0) - cur("total")) <= 2;
+      if (best && !okNow) {
+        const put = (key, a) => { if (!F[key] || toMoney(F[key].value) !== a.v) { delete F[key]; set(key, fmtMoney(a.v), a.l, "pattern"); } };
+        put("supply", best.s); put("vat", best.v); put("total", best.t);
+      }
     }
 
     // 5) 계산으로 비어 있는 금액 채우기(반드시 「추정」)
@@ -328,6 +411,46 @@
     return checks;
   }
 
+  // ── 두 읽기 합치기 — 같은 영수증을 서로 다른 방식으로 두 번 읽은 결과(a · b)를 항목마다 고른다 ──────────
+  // 같으면 그대로(믿을 만함). 다르면 검증을 통과하는 쪽(사업자번호 검증번호 · 금액 삼각 관계 · 날짜 · 8자리 승인번호).
+  // 둘 다 통과하거나 둘 다 못 하면 신뢰도가 높은 쪽을 쓰되 「확인 필요」 로 두고 다른 값을 후보(alt)로 남긴다 — 리뷰에서 한 번에 바꿀 수 있게.
+  function mergeReadings(a, b) {
+    const year = new Date().getFullYear();
+    const ok = {
+      bizNo: (v) => bizNoValid(v),
+      txnDate: (v) => { const y = Number(String(v).slice(0, 4)); return y >= 2000 && y <= year + 1 && String(v).length > 10; },
+      approvalDate: (v) => { const y = Number(String(v).slice(0, 4)); return y >= 2000 && y <= year + 1; },
+      approvalNo: (v) => /^\d{8}$/.test(v),
+      cardNo: (v) => (String(v).match(/\d/g) || []).length >= 4,
+      phone: (v) => /^0\d{1,2}-\d{3,4}-\d{4}$/.test(v),
+    };
+    const money = (r) => { const g = (k) => (r.fields[k] ? toMoney(r.fields[k].value) : null); return { s: g("supply"), v: g("vat"), t: g("total"), tf: g("taxFree") || 0, sf: g("serviceFee") || 0 }; };
+    const tri = (m) => m.s != null && m.v != null && m.t != null && Math.abs(m.s + m.v + m.tf + m.sf - m.t) <= 2 && Math.abs(m.v - Math.round(m.s * 0.1)) <= Math.max(2, m.s * 0.003);
+    const conf = (f) => (f && f.conf != null ? f.conf : 60);
+    const F = {};
+    // 금액 셋은 한 묶음으로 — 삼각 관계가 맞는 쪽을 통째로
+    const ma = money(a), mb = money(b), ta = tri(ma), tb = tri(mb);
+    const moneyFrom = ta && !tb ? a : tb && !ta ? b : null;
+    const keys = new Set([...Object.keys(a.fields), ...Object.keys(b.fields)]);
+    for (const k of keys) {
+      const fa = a.fields[k], fb = b.fields[k];
+      if (moneyFrom && ["supply", "vat", "total"].includes(k)) { const f = moneyFrom.fields[k]; if (f) F[k] = { ...f, how: f.how, agree: false, src: moneyFrom === a ? "a" : "b" }; continue; }
+      if (!fa || !fb) { F[k] = { ...(fa || fb), src: fa ? "a" : "b" }; continue; }
+      const same = MONEY_FIELDS.includes(k) ? toMoney(fa.value) === toMoney(fb.value) : String(fa.value).replace(/\s/g, "") === String(fb.value).replace(/\s/g, "");
+      if (same) { F[k] = { ...fa, agree: true, src: "a", conf: Math.max(conf(fa), conf(fb)) }; delete F[k].suspect; if (fa.suspect && fb.suspect) F[k].suspect = fa.suspect; continue; }
+      const va = ok[k] ? ok[k](fa.value) : null, vb = ok[k] ? ok[k](fb.value) : null;
+      if (va && !vb) { F[k] = { ...fa, src: "a" }; continue; }
+      if (vb && !va) { F[k] = { ...fb, src: "b" }; continue; }
+      const [win, lose] = conf(fb) > conf(fa) ? [fb, fa] : [fa, fb];
+      F[k] = { ...win, src: win === fa ? "a" : "b", alt: lose.value, suspect: [...(win.suspect || []), "두 번 읽은 값이 다릅니다"] };
+    }
+    // 품목 — 합계와 맞는 쪽, 아니면 더 많이 읽은 쪽
+    const tot = F.total ? toMoney(F.total.value) : null, sum = (r) => r.items.reduce((s, i) => s + (i.amount || 0), 0);
+    const fromB = !(tot != null && sum(a) === tot) && ((tot != null && sum(b) === tot) || b.items.length > a.items.length);
+    const items = (fromB ? b.items : a.items).map((it) => ({ ...it, src: fromB ? "b" : "a" }));
+    return { fields: F, items, checks: runChecks(F, items), lines: a.lines, lines2: b.lines };
+  }
+
   // 사업자등록번호 검증(국세청 가중치 1,3,7,1,3,7,1,3,5)
   function bizNoValid(v) {
     const d = String(v).replace(/\D/g, "");
@@ -339,7 +462,7 @@
     return (10 - (s % 10)) % 10 === Number(d[9]);
   }
 
-  const api = { FIELD_GROUPS, MONEY_FIELDS, parseReceipt, runChecks, parseItemLine, parseDate, toMoney, fmtMoney, bizNoValid, norm };
+  const api = { FIELD_GROUPS, MONEY_FIELDS, parseReceipt, mergeReadings, runChecks, parseItemLine, parseDate, toMoney, fmtMoney, bizNoValid, norm };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.ReceiptParser = api;
 })(typeof window !== "undefined" ? window : globalThis);

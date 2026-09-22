@@ -7,10 +7,14 @@
 <!-- OCR 은 브라우저 안에서 돈다(Tesseract.js · WebAssembly). 영수증 이미지는 어디로도 보내지 않는다. -->
 <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.0/lib/msal-browser.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<!-- PaddleOCR 글줄 검출(ONNX) — 영수증 찾기 · 방향 · 나누기. 모델은 이 사이트의 models/ 에서(Apache-2.0) -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <style>
   :root { --blue:#0078d4; --navy:#0f2744; --ok:#107c10; --warn:#b45309; --bad:#a4262c; --line:#e1dfdd; --muted:#605e5c; --soft:#a19f9d; --bg:#f3f2f1; }
   * { box-sizing: border-box; }
+  /* hidden 속성이 display 규칙(.btn · .ackall 등)에 덮이지 않게 — 로그인 전 로그아웃 단추 · 검산 확인 칸이 보이던 문제 */
+  [hidden] { display: none !important; }
   html, body { margin: 0; font-family: 'Segoe UI', sans-serif; background: var(--bg); color: #323130; }
   button { font-family: inherit; cursor: pointer; }
   .top { background: linear-gradient(90deg, #0f2744, #0a4a8a); color: #fff; padding: 14px 24px; display: flex; align-items: center; gap: 14px; }
@@ -89,6 +93,12 @@
   table.hist th { text-align: left; color: var(--muted); font-weight: 600; padding: 7px 6px; border-bottom: 1px solid var(--line); background: #faf9f8; white-space: nowrap; }
   table.hist td { padding: 7px 6px; border-bottom: 1px solid #f3f2f1; }
   table.hist td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .tab { border: 1px solid #d2d0ce; background: #fff; border-radius: 999px; padding: 4px 12px; font-size: .76rem; font-weight: 600; color: var(--muted); }
+  .tab.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .tab.done { border-color: #c7e6c7; color: var(--ok); } .tab.on.done { background: var(--ok); border-color: var(--ok); color: #fff; }
+  .altbtn { border: 1px dashed #c8c6c4; background: #faf9f8; color: #323130; border-radius: 5px; font-size: .7rem; padding: 2px 8px; margin-left: 6px; }
+  .altbtn:hover { border-color: var(--blue); color: var(--blue); }
   .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: #201f1e; color: #fff; padding: 9px 16px; border-radius: 6px; font-size: .8rem; opacity: 0; transition: .2s; pointer-events: none; }
   .toast.on { opacity: 1; }
   .login { max-width: 400px; margin: 70px auto; text-align: center; }
@@ -139,6 +149,7 @@
       </div>
       <div class="prog" id="prog"><div class="bar"><i id="progBar"></i></div><div class="lbl" id="progLbl"></div></div>
       <div class="imgbox" id="imgbox"><img id="img" alt="영수증"><div class="hl" id="hl"></div></div>
+      <div style="margin-top:6px;font-size:.72rem;text-align:right" id="origWrap" hidden><a href="#" id="origLink" target="_blank" rel="noopener" style="color:var(--muted)">원본 사진 보기</a></div>
       <details class="raw" id="raw" hidden><summary>인식된 원문 보기</summary><pre id="rawText"></pre></details>
     </section>
 
@@ -228,16 +239,29 @@
   // ── 공통 도우미 ─────────────────────────────────────────────────────────────
   // 전각 → 반각, 흔한 OCR 혼동 정리(숫자 문맥의 O/o → 0, l/I → 1 은 숫자 사이에서만)
   function norm(s) {
-    return String(s || "")
+    let t = String(s || "")
       .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
       .replace(/\u3000/g, " ")
       .replace(/[：﹕]/g, ":")
       .replace(/(?<=\d)[Oo](?=\d)/g, "0")
       .replace(/(?<=\d)[lI|](?=\d)/g, "1")
       .replace(/[ \t]+/g, " ")
+      .replace(/※|\u203B/g, "*")
+      // 「10, 100」 「35. 000」 — 천 단위 구분 뒤에 끼어든 공백
+      .replace(/(\d{1,3})[,.]\s(\d{3})(?!\d)/g, "$1,$2")
       .trim();
+    // Tesseract 는 한글 음절마다 띄어 읽는 일이 잦다(「메 가 커 피 오 리 역 점」). 한 글자 한글이 셋 이상 이어지면 붙인다.
+    t = t.replace(/(?:^|(?<= ))(?:[가-힣] ){2,}[가-힣](?= |$)/g, (m) => m.replace(/ /g, ""));
+    for (const [re, to] of LABEL_FIX) t = t.replace(re, to);
+    return t;
   }
-  const squash = (s) => s.replace(/\s+/g, "");               // 라벨 비교용(「부 가 세」 → 「부가세」)
+  const squash = (s) => s.replace(/\s+/g, "");
+  // 감열지 한글 라벨의 흔한 오인식(실제 영수증 8장에서 확인) — 「승인」 → 슴인 · 「번호」 → 번오/번요/번모 ·
+  // 「금액」 → 금맥/글액 · 「합계」 → 합게 · 「가액」 → 가맥 · 「물품」 → 불품/룰품 · 「발행」 → 발앵
+  const LABEL_FIX = [
+    [/[승슴스]\s?[인이]\s?(?=번|일|금|내|정)/g, "승인"], [/번\s?[호오요모]\b|번\s?[호오요모](?=\s|:|\]|$)/g, "번호"],
+    [/금\s?[액맥]|글\s?액/g, "금액"], [/합\s?[게계](?!좌)/g, "합계"], [/가\s?맥/g, "가액"], [/[불룰]\s?품/g, "물품"], [/발\s?앵/g, "발행"],
+  ];               // 라벨 비교용(「부 가 세」 → 「부가세」)
   // 금액 — 「21,400」 「21.400」(쉼표가 점으로 읽힘) 「21400원」 「₩21,400」 「-1,000」
   const MONEY_RE = /-?\s?[₩\\]?\s?\d{1,3}(?:[,.]\d{3})+(?!\d)|-?\s?[₩\\]?\s?\d{1,9}(?=\s*원?\s*$|\s*원)/g;
   function toMoney(tok) {
@@ -254,8 +278,10 @@
   }
   const fmtMoney = (n) => (n == null || isNaN(n) ? "" : Number(n).toLocaleString("ko-KR"));
   // 날짜 · 시각 — 2026-09-22 14:35:12 · 2026.09.22 · 26/09/22 · 2026년 9월 22일
-  const DATE_RE = /(20\d{2}|\b\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s*일?(?:\s*\(?[월화수목금토일]\)?)?(?:\s*(\d{1,2})\s*[:시]\s*(\d{2})(?:\s*[:분]\s*(\d{2}))?)?/;
+  const DATE_RE = /(20\d{2}|\b\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s*일?(?:\s*\([^)]{1,3}\)|\s*[월화수목금토일])?(?:\s*(오전|오후|AM|PM)?\s*(\d{1,2})\s*[:시]\s*(\d{2})(?:\s*[:분]\s*(\d{2}))?)?/i;
   function parseDate(text) {
+    // 「20260910 12:06:33」 처럼 붙은 날짜
+    text = String(text).replace(/\b(20\d{2})(\d{2})(\d{2})(?=\s+\d{1,2}:\d{2})/, "$1-$2-$3");
     const m = String(text).match(DATE_RE);
     if (!m) return null;
     let y = Number(m[1]); if (y < 100) y += 2000;
@@ -263,7 +289,10 @@
     if (mo < 1 || mo > 12 || d < 1 || d > 31 || y < 2000 || y > 2099) return null;
     const p = (n) => String(n).padStart(2, "0");
     let v = `${y}-${p(mo)}-${p(d)}`;
-    if (m[4] != null && Number(m[4]) < 24 && Number(m[5]) < 60) v += ` ${p(m[4])}:${m[5]}${m[6] != null ? ":" + m[6] : ""}`;
+    let hh = m[5] != null ? Number(m[5]) : null;
+    if (hh != null && /오후|PM/i.test(m[4] || "") && hh < 12) hh += 12;
+    if (hh != null && /오전|AM/i.test(m[4] || "") && hh === 12) hh = 0;
+    if (hh != null && hh < 24 && Number(m[6]) < 60) v += ` ${p(hh)}:${m[6]}${m[7] != null ? ":" + m[7] : ""}`;
     return v;
   }
   const afterColon = (t) => { const i = t.indexOf(":"); return i >= 0 ? t.slice(i + 1).trim() : ""; };
@@ -389,7 +418,10 @@
           case "txnDate": case "approvalDate": { const d = parseDate(l.t); if (d) set(key, d, l, "label"); break; }
           case "cardNo": { const m = l.t.match(/[\d*xX]{4}[-\s]?[\d*xX]{2,4}[-\s]?[\d*xX]{2,4}[-\s]?[\d*xX]{2,4}/); if (m) set(key, groupCard(m[0]), l, "label"); break; }
           case "installment": { if (/일시불|일시|00\s*개월|^0$/.test(rest) || /일시불/.test(l.t)) set(key, "일시불", l, "label"); else { const m = l.t.match(/(\d{1,2})\s*개?월?/g); const n = m ? Number(String(m[m.length - 1]).replace(/\D/g, "")) : null; if (n != null) set(key, n === 0 ? "일시불" : `${n}개월`, l, "label"); } break; }
-          case "approvalNo": case "merchantNo": case "cashReceiptNo": { const m = l.t.match(/(\d[\d\s-]{4,18}\d)(?!.*\d)/); if (m) set(key, m[1].replace(/\s/g, ""), l, "label"); break; }
+          case "approvalNo": case "merchantNo": case "cashReceiptNo": {
+            const after = l.t.slice(l.t.search(new RegExp(hit.lb.split("").join("\\s*"))) + 1).replace(/\((?=\d{7}\b)/, "0");
+            const m = after.match(/(?<![\d,])(\d[\d-]{5,14}\d)(?![\d,])/);
+            if (m) set(key, m[1].replace(/-/g, ""), l, "label"); break; }
           case "receiptNo": { const m = rest.match(/[A-Za-z0-9][\w\-/]{3,}/); if (m) set(key, m[0], l, "label"); break; }
           case "pos": { const m = l.t.match(/(?:POS|포스)\s*:?\s*([\w-]+)/i); const c = l.t.match(/(?:계산원|캐셔|담당)\s*:?\s*([가-힣\w]+)/); if (m || c) set(key, [m && m[1], c && c[1]].filter(Boolean).join(" · "), l, "label"); break; }
           case "cardIssuer": { if (rest) set(key, rest.replace(/\((신용|체크|기프트|선불|직불)\)/, "").trim() || rest, l, "label"); const ty = l.t.match(/신용|체크|기프트|선불|직불/); if (ty) set("cardType", ty[0], l, "label"); break; }
@@ -400,9 +432,28 @@
       }
     }
 
+    // 1-2) 라벨이 한 줄, 값이 다음 줄에 칸 맞춰 있는 표
+    const HEAD = [["supply", /과세물품|공급가/], ["vat", /부가세|세액/], ["taxFree", /면세/], ["total", /합계|총액|결제금액/], ["discount", /할인/]];
+    for (let k = 0; k + 1 < lines.length; k++) {
+      const l = lines[k], nx = lines[k + 1];
+      if (/\d{2,}/.test(l.t)) continue;
+      const hits = [];
+      for (const w of l.t.split(/\s+/).filter(Boolean)) { const h = HEAD.find(([, re]) => re.test(w.replace(/\s/g, ""))); if (h) hits.push(h[0]); }
+      if (hits.length < 2) continue;
+      const vals = (nx.t.match(MONEY_RE) || []).map(toMoney);
+      if (vals.length !== hits.length) continue;
+      hits.forEach((key, j) => { if (!F[key]) set(key, fmtMoney(vals[j]), nx, "label"); });
+    }
+
     // 2) 값 모양으로 찾기 — 라벨이 깨졌을 때
     for (const l of lines) {
-      if (!F.bizNo) { const m = l.t.match(/\b(\d{3})-(\d{2})-(\d{5})\b/); if (m) set("bizNo", `${m[1]}-${m[2]}-${m[3]}`, l, "pattern"); }
+      if (!F.bizNo) { const m = l.t.match(/\b(\d{3})\s?-\s?(\d{2})\s?-\s?(\d{5})\b/); if (m) set("bizNo", `${m[1]}-${m[2]}-${m[3]}`, l, "pattern"); }
+      // 하이픈 없는 10자리 — 검증번호가 맞을 때만(전화 · 승인번호 오인 방지)
+      if (!F.bizNo) { for (const m of l.t.matchAll(/(?<![\d-])(\d{10})(?![\d-])/g)) { if (bizNoValid(m[1])) { set("bizNo", `${m[1].slice(0, 3)}-${m[1].slice(3, 5)}-${m[1].slice(5)}`, l, "pattern"); break; } } }
+      // 라벨 없는 승인번호 — 「[07404100] KICC로 제출」 처럼 8자리 숫자 옆에 VAN 이름
+      if (!F.approvalNo) { const m = l.t.match(/\[?\b(\d{8})\b\]?\s*.*\b(KICC|KIS|NICE|KSNET|KOVAN|SMARTRO|JTNET|FDIK|KCP|DAOU|SPC|KFTC)\b/i) || l.t.match(/\b(KICC|KIS|NICE|KSNET|KOVAN|SMARTRO|JTNET|FDIK|KCP|DAOU|SPC|KFTC)\b.*?\b(\d{8})\b/i);
+        if (m) set("approvalNo", /^\d{8}$/.test(m[1]) ? m[1] : m[2], l, "pattern"); }
+      if (!F.approvalNo) { const m = l.t.match(/^\s*\[\s*(\d{8})\s*\]/); if (m && !/\d{4}[-./]\d{2}/.test(l.t)) set("approvalNo", m[1], l, "pattern"); }
       if (!F.phone) { const m = l.t.match(/\b(0\d{1,2})-(\d{3,4})-(\d{4})\b/); if (m && !/카드|계좌/.test(l.t)) set("phone", `${m[1]}-${m[2]}-${m[3]}`, l, "pattern"); }
       if (!F.cardNo) { const m = l.t.match(/\b\d{4}[-\s]?[\d*]{2,4}\*[\d*]*[-\s]?[\d*]{4}[-\s]?[\d*]{3,4}\b/); if (m) set("cardNo", groupCard(m[0]), l, "pattern"); }
       if (!F.address && /(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)[가-힣]*\s/.test(l.t) && /(구|군|시)\s/.test(l.t) && /(로|길|동|읍|면)\s*\d|(로|길)\b/.test(l.t)) set("address", l.t.replace(/^주소\s*:?\s*/, ""), l, "pattern");
@@ -410,15 +461,36 @@
       if (!F.cardType) { const ty = l.t.match(/\((신용|체크)\)|(신용|체크)\s*카드/); if (ty) set("cardType", ty[1] || ty[2], l, "pattern"); }
     }
     // 날짜 — 라벨이 없으면 승인과 무관한 첫 날짜가 거래일시
-    const dateLines = lines.map((l) => ({ l, d: parseDate(l.t) })).filter((x) => x.d);
-    if (!F.txnDate) { const x = dateLines.find((x) => !/승인/.test(x.l.sq)) || dateLines[0]; if (x) set("txnDate", x.d, x.l, "pattern"); }
+    // 날짜만 있는 줄 다음 줄이 시각으로 시작하면 이어 붙인다(「판매시간: 2026-08-26」 / 「11:38:23」)
+    const dateLines = lines.map((l, k) => {
+      let d = parseDate(l.t);
+      if (d && d.length === 10) { const nx = lines[k + 1]; const tm = nx && nx.t.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/); if (tm && !parseDate(nx.t)) d += ` ${tm[1].padStart(2, "0")}:${tm[2]}${tm[3] ? ":" + tm[3] : ""}`; }
+      return { l, d };
+    }).filter((x) => x.d);
+    const withTime = dateLines.filter((x) => x.d.length > 10);
+    if (F.txnDate && F.txnDate.value.length === 10) { const x = withTime.find((x) => x.d.startsWith(F.txnDate.value)); if (x) F.txnDate = { ...F.txnDate, value: x.d }; }
+    if (!F.txnDate) { const x = withTime.find((x) => !/승인/.test(x.l.sq)) || dateLines.find((x) => !/승인/.test(x.l.sq)) || dateLines[0]; if (x) set("txnDate", x.d, x.l, "pattern"); }
     if (!F.approvalDate && (F.approvalNo || F.cardNo)) { const x = dateLines.find((x) => /승인/.test(x.l.sq)) || dateLines[dateLines.length - 1]; if (x && x.l.i !== (F.txnDate && F.txnDate.line)) set("approvalDate", x.d, x.l, "pattern"); }
+    if (F.txnDate) {
+      const dd = F.txnDate.value.slice(5, 10).replace("-", "");
+      for (const l of lines) { const m = l.t.match(/\b(20\d{2})(\d{4})(?=[-_\d])/); if (m && m[2] === dd && m[1] !== F.txnDate.value.slice(0, 4)) { F.txnDate = { ...F.txnDate, value: m[1] + F.txnDate.value.slice(4), how: "pattern" }; break; } }
+    }
     // 영수증번호 — 라벨이 깨졌어도 「날짜숫자-..-....」 모양이면
     if (!F.receiptNo) { const l = lines.find((l) => /\b20\d{6}[-_]\d{1,4}[-_]\d{2,6}\b/.test(l.t)); if (l) set("receiptNo", l.t.match(/\b20\d{6}[-_]\d{1,4}[-_]\d{2,6}\b/)[0], l, "pattern"); }
     // 상호 — 라벨이 없으면 맨 위쪽에서 제목(영수증 · 매출전표 등)이 아닌 첫 한글 줄
     if (!F.storeName) {
-      const l = lines.slice(0, 6).find((l) => /[가-힣]{2,}/.test(l.t) && !/영\s*수\s*증|매출\s*전표|전표|RECEIPT|고객용|카드|사업자|주소|TEL|전화|\d{3}-\d{2}-\d{5}/i.test(l.t) && !/^\[.*\]$/.test(l.t));
-      if (l) set("storeName", l.t.replace(/^상호\s*:?\s*/, ""), l, "pattern");
+      // 위쪽 줄 중에서 — 지점 이름처럼 보이는 줄(「…점」 「(…점)」 「…지점 · 매장」)을 먼저. 체인 표어(「재미있는 일상 플랫폼」)나
+      // 제목 줄보다 「GS25서울스퀘어점」 같은 줄이 상호다(실제 영수증에서 확인). 없으면 첫 한글 줄.
+      // 상호 뒤에 사업자번호 · 대표자 · 전화가 한 줄로 붙는 영수증이 많다 — 줄을 버리지 않고 앞부분만 쓴다
+      const storePart = (t) => t.replace(/^(\[영수증\]|상호)\s*:?\s*/, "").split(/\s*\/\s*|\s{2,}|\s(?=\d{3}-?\d{2}-?\d{5}\b)|\s(?=0\d{1,2}-\d{3,4}-\d{4})|\s(?=TEL)/i)[0].trim();
+      const cand = lines.slice(0, 8).filter((l) => /[가-힣]{2,}/.test(storePart(l.t)) && !/영\s*수\s*증|매출\s*전표|전표|RECEIPT|고객용|교환권|카드|사업.{0,2}번|주소|^TEL|전화|상품명|품명|수량|단가|금액|합계|대표|하나\s*\(|구외환/i.test(storePart(l.t))
+        && !/(대로|[가-힣]로\s?\d|[가-힣]길\s?\d|\s[가-힣]{1,3}구\s)/.test(storePart(l.t)) && !/^\[.*\]$/.test(l.t)
+        // 깨진 줄 거르기 — 글자의 절반 이상이 한글(또는 「GS25서울스퀘어점」 같은 영문 체인 + 지점)이고, 문장부호로 시작하지 않을 것
+        && !/^[^가-힣A-Za-z0-9(]/.test(storePart(l.t)) && !/공급가/.test(l.t)
+        && ((storePart(l.t).match(/[가-힣]/g) || []).length / Math.max(1, storePart(l.t).replace(/\s/g, "").length) >= 0.5 || /^[A-Z]{2,}\d*[가-힣]+점/.test(storePart(l.t))));
+      const branch = (t) => /[가-힣A-Za-z0-9)]\s*(점|지점|본점|매장)(\)|\s|\/|$)/.test(t);
+      const l = cand.find((l) => branch(storePart(l.t))) || cand[0];
+      if (l) set("storeName", storePart(l.t), l, "pattern");
     }
 
     // 3) 품목 — 머리줄(상품명 · 품명 · 메뉴) 다음부터 합계류 줄 전까지
@@ -440,6 +512,28 @@
       if (F.cardNo || F.approvalNo || F.cardIssuer) set("payMethod", "카드", null, "derived");
       else if (F.accountNo || lines.some((l) => /계좌이체|무통장/.test(l.sq))) set("payMethod", "계좌이체", null, "derived");
       else if (F.cashReceiptNo || F.received || lines.some((l) => /현금/.test(l.sq))) set("payMethod", "현금", null, "derived");
+    }
+
+    // 4-2) 금액 삼각 측량 — 영수증의 모든 금액에서 s + v = t, v ≈ s × 10% 인 세 값을 찾는다.
+    //      라벨로 찾은 값이 이 관계를 이미 만족하면 그대로 두고, 아니면 빈 칸 · 틀린 칸을 이 값으로 채운다(「모양으로 찾음」).
+    {
+      const amts = [];
+      lines.forEach((l) => { for (const m of (l.t.match(MONEY_RE) || [])) { const v = toMoney(m); if (v >= 10 && v < 1e9) amts.push({ v, l }); } });
+      const uniq = [...new Map(amts.map((a) => [a.v, a])).values()];
+      let best = null;
+      for (const a of uniq) for (const b of uniq) {
+        if (b.v >= a.v || b.v === 0) continue;
+        const need = a.v + b.v, t = uniq.find((x) => Math.abs(x.v - need) <= 1);
+        if (!t || Math.abs(b.v - Math.round(a.v * 0.1)) > Math.max(2, a.v * 0.003)) continue;
+        const cnt = amts.filter((x) => x.v === t.v).length;               // 합계는 영수증에 여러 번 찍힌다
+        if (!best || cnt > best.cnt || (cnt === best.cnt && t.v > best.t.v)) best = { s: a, v: b, t, cnt };
+      }
+      const cur = (k) => (F[k] ? toMoney(F[k].value) : null);
+      const okNow = cur("supply") != null && cur("vat") != null && cur("total") != null && Math.abs(cur("supply") + cur("vat") + (cur("taxFree") || 0) + (cur("serviceFee") || 0) - cur("total")) <= 2;
+      if (best && !okNow) {
+        const put = (key, a) => { if (!F[key] || toMoney(F[key].value) !== a.v) { delete F[key]; set(key, fmtMoney(a.v), a.l, "pattern"); } };
+        put("supply", best.s); put("vat", best.v); put("total", best.t);
+      }
     }
 
     // 5) 계산으로 비어 있는 금액 채우기(반드시 「추정」)
@@ -495,6 +589,46 @@
     return checks;
   }
 
+  // ── 두 읽기 합치기 — 같은 영수증을 서로 다른 방식으로 두 번 읽은 결과(a · b)를 항목마다 고른다 ──────────
+  // 같으면 그대로(믿을 만함). 다르면 검증을 통과하는 쪽(사업자번호 검증번호 · 금액 삼각 관계 · 날짜 · 8자리 승인번호).
+  // 둘 다 통과하거나 둘 다 못 하면 신뢰도가 높은 쪽을 쓰되 「확인 필요」 로 두고 다른 값을 후보(alt)로 남긴다 — 리뷰에서 한 번에 바꿀 수 있게.
+  function mergeReadings(a, b) {
+    const year = new Date().getFullYear();
+    const ok = {
+      bizNo: (v) => bizNoValid(v),
+      txnDate: (v) => { const y = Number(String(v).slice(0, 4)); return y >= 2000 && y <= year + 1 && String(v).length > 10; },
+      approvalDate: (v) => { const y = Number(String(v).slice(0, 4)); return y >= 2000 && y <= year + 1; },
+      approvalNo: (v) => /^\d{8}$/.test(v),
+      cardNo: (v) => (String(v).match(/\d/g) || []).length >= 4,
+      phone: (v) => /^0\d{1,2}-\d{3,4}-\d{4}$/.test(v),
+    };
+    const money = (r) => { const g = (k) => (r.fields[k] ? toMoney(r.fields[k].value) : null); return { s: g("supply"), v: g("vat"), t: g("total"), tf: g("taxFree") || 0, sf: g("serviceFee") || 0 }; };
+    const tri = (m) => m.s != null && m.v != null && m.t != null && Math.abs(m.s + m.v + m.tf + m.sf - m.t) <= 2 && Math.abs(m.v - Math.round(m.s * 0.1)) <= Math.max(2, m.s * 0.003);
+    const conf = (f) => (f && f.conf != null ? f.conf : 60);
+    const F = {};
+    // 금액 셋은 한 묶음으로 — 삼각 관계가 맞는 쪽을 통째로
+    const ma = money(a), mb = money(b), ta = tri(ma), tb = tri(mb);
+    const moneyFrom = ta && !tb ? a : tb && !ta ? b : null;
+    const keys = new Set([...Object.keys(a.fields), ...Object.keys(b.fields)]);
+    for (const k of keys) {
+      const fa = a.fields[k], fb = b.fields[k];
+      if (moneyFrom && ["supply", "vat", "total"].includes(k)) { const f = moneyFrom.fields[k]; if (f) F[k] = { ...f, how: f.how, agree: false, src: moneyFrom === a ? "a" : "b" }; continue; }
+      if (!fa || !fb) { F[k] = { ...(fa || fb), src: fa ? "a" : "b" }; continue; }
+      const same = MONEY_FIELDS.includes(k) ? toMoney(fa.value) === toMoney(fb.value) : String(fa.value).replace(/\s/g, "") === String(fb.value).replace(/\s/g, "");
+      if (same) { F[k] = { ...fa, agree: true, src: "a", conf: Math.max(conf(fa), conf(fb)) }; delete F[k].suspect; if (fa.suspect && fb.suspect) F[k].suspect = fa.suspect; continue; }
+      const va = ok[k] ? ok[k](fa.value) : null, vb = ok[k] ? ok[k](fb.value) : null;
+      if (va && !vb) { F[k] = { ...fa, src: "a" }; continue; }
+      if (vb && !va) { F[k] = { ...fb, src: "b" }; continue; }
+      const [win, lose] = conf(fb) > conf(fa) ? [fb, fa] : [fa, fb];
+      F[k] = { ...win, src: win === fa ? "a" : "b", alt: lose.value, suspect: [...(win.suspect || []), "두 번 읽은 값이 다릅니다"] };
+    }
+    // 품목 — 합계와 맞는 쪽, 아니면 더 많이 읽은 쪽
+    const tot = F.total ? toMoney(F.total.value) : null, sum = (r) => r.items.reduce((s, i) => s + (i.amount || 0), 0);
+    const fromB = !(tot != null && sum(a) === tot) && ((tot != null && sum(b) === tot) || b.items.length > a.items.length);
+    const items = (fromB ? b.items : a.items).map((it) => ({ ...it, src: fromB ? "b" : "a" }));
+    return { fields: F, items, checks: runChecks(F, items), lines: a.lines, lines2: b.lines };
+  }
+
   // 사업자등록번호 검증(국세청 가중치 1,3,7,1,3,7,1,3,5)
   function bizNoValid(v) {
     const d = String(v).replace(/\D/g, "");
@@ -506,9 +640,318 @@
     return (10 - (s % 10)) % 10 === Number(d[9]);
   }
 
-  const api = { FIELD_GROUPS, MONEY_FIELDS, parseReceipt, runChecks, parseItemLine, parseDate, toMoney, fmtMoney, bizNoValid, norm };
+  const api = { FIELD_GROUPS, MONEY_FIELDS, parseReceipt, mergeReadings, runChecks, parseItemLine, parseDate, toMoney, fmtMoney, bizNoValid, norm };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.ReceiptParser = api;
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+<script>
+/* ============================================================================
+   STK 영수증 비전 — 사진 한 장에서 영수증을 찾아 바로 세우고, 두 방식으로 읽을 이미지를 만든다.
+   (Python 시험판 pipe2.py 를 그대로 옮긴 것 — 실제 영수증 8장에서 핵심 항목 93%)
+
+   1) PaddleOCR PP-OCRv5 글줄 검출(ONNX, 언어 무관) — 책상 · 손 · 그림자를 빼고 글자 줄만 찾는다.
+   2) 방향 — 글줄 상자가 대부분 세로로 길면 90° 돌리고, PaddleOCR 방향 분류기로 180° 를 가른다. 작은 기울기는 상자 각도의 중앙값으로 편다.
+   3) 영수증 나누기 — 종이(밝고 채도 낮은 영역) 단위로 묶고, 한 종이 안에 영수증이 붙어 있으면 글 간격으로 다시 나눈다.
+      그림자 · 구김으로 종이에서 빠진 글줄은 버리지 않고 가장 가까운 영수증에 붙인다.
+   4) 읽을 이미지 두 가지 — ① 영역: 글줄 밖을 흰색으로 지운 영수증 영역 ② 글줄 시트: 검출 상자를 줄마다 잘라
+      대비 · 높이를 맞춰 다시 쌓은 것. 앱이 둘 다 Tesseract 로 읽고 ReceiptParser.mergeReadings 로 항목마다 고른다.
+
+   필요: window.ort(onnxruntime-web). 모델: models/det.onnx · models/cls.onnx(PaddleOCR, Apache-2.0).
+   ========================================================================== */
+(function (root) {
+  "use strict";
+  const DEG = Math.PI / 180;
+  let _det = null, _cls = null;
+  async function sessions(base) {
+    if (!_det) {
+      const opt = { executionProviders: ["wasm"], graphOptimizationLevel: "all" };
+      [_det, _cls] = await Promise.all([ort.InferenceSession.create(base + "det.onnx", opt), ort.InferenceSession.create(base + "cls.onnx", opt)]);
+    }
+    return { det: _det, cls: _cls };
+  }
+
+  // ── 캔버스 도우미 ──────────────────────────────────────────────────────────
+  const mk = (w, h) => { const c = document.createElement("canvas"); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h)); return c; };
+  const ctx2 = (c) => c.getContext("2d", { willReadFrequently: true });
+  function rotateCanvas(src, deg) {                                     // 90 · 180 · 270 은 크기 바뀜, 그 밖은 같은 크기(흰 바탕)
+    const q = ((deg % 360) + 360) % 360;
+    const swap = q === 90 || q === 270;
+    const c = swap ? mk(src.height, src.width) : mk(src.width, src.height), x = ctx2(c);
+    x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+    x.translate(c.width / 2, c.height / 2); x.rotate(deg * DEG); x.drawImage(src, -src.width / 2, -src.height / 2);
+    return c;
+  }
+  // 사각형의 방향은 180° 마다 같다 — (-90°, 90°] 로 맞춘다. 안 맞추면 캘리퍼가 돌려준 ±180° 근처 각도 때문에
+  // 글줄 조각이 뒤집혀 잘리고, 방향 분류기가 「뒤집힘」 이라 해 영수증 전체를 거꾸로 세웠다(시험에서 확인).
+  const normA = (a) => { a = ((a + Math.PI / 2) % Math.PI + Math.PI) % Math.PI - Math.PI / 2; return a <= -Math.PI / 2 + 1e-9 ? a + Math.PI : a; };
+  // 회전 사각형 { cx, cy, w, h, a(라디안, w 변의 방향) } 을 잘라 가로로 눕힌 캔버스로
+  function rectCrop(src, b, pad = 0) {
+    let { cx, cy, w, h, a } = b;
+    if (w < h) { [w, h] = [h, w]; a += Math.PI / 2; }
+    a = normA(a);
+    const e = Math.min(w, h) * pad; w += e; h += e;
+    const c = mk(w, h), x = ctx2(c);
+    x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+    x.translate(c.width / 2, c.height / 2); x.rotate(-a); x.drawImage(src, -cx, -cy);
+    return c;
+  }
+  function boxPoints(b, grow = 0) {
+    const w = b.w + grow, h = b.h + grow, ca = Math.cos(b.a), sa = Math.sin(b.a);
+    return [[-w / 2, -h / 2], [w / 2, -h / 2], [w / 2, h / 2], [-w / 2, h / 2]].map(([x, y]) => [b.cx + x * ca - y * sa, b.cy + x * sa + y * ca]);
+  }
+  const shortSide = (b) => Math.min(b.w, b.h);
+  function grayOf(c) {
+    const d = ctx2(c).getImageData(0, 0, c.width, c.height).data, g = new Float32Array(c.width * c.height);
+    for (let i = 0, j = 0; j < g.length; i += 4, j++) g[j] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    return g;
+  }
+  function putGray(g, w, h) {
+    const c = mk(w, h), x = ctx2(c), im = x.createImageData(w, h);
+    for (let i = 0, j = 0; j < g.length; i += 4, j++) { const v = g[j] < 0 ? 0 : g[j] > 255 ? 255 : g[j]; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
+    x.putImageData(im, 0, 0); return c;
+  }
+  function boxBlur(src, w, h, r) {                                        // 가로 · 세로 누적합
+    const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) { let s = 0; const o = y * w;
+      for (let x = -r; x < w; x++) { if (x + r < w) s += src[o + x + r]; if (x - r - 1 >= 0) s -= src[o + x - r - 1]; if (x >= 0) tmp[o + x] = s / (Math.min(w - 1, x + r) - Math.max(0, x - r) + 1); } }
+    for (let x = 0; x < w; x++) { let s = 0;
+      for (let y = -r; y < h; y++) { if (y + r < h) s += tmp[(y + r) * w + x]; if (y - r - 1 >= 0) s -= tmp[(y - r - 1) * w + x]; if (y >= 0) out[y * w + x] = s / (Math.min(h - 1, y + r) - Math.max(0, y - r) + 1); } }
+    return out;
+  }
+  function percentile(g, p) {
+    const hist = new Uint32Array(256); for (let j = 0; j < g.length; j++) hist[Math.max(0, Math.min(255, g[j] | 0))]++;
+    let c = 0, n = g.length * p; for (let v = 0; v < 256; v++) { c += hist[v]; if (c >= n) return v; } return 255;
+  }
+  function stretch(g, lo, hi) { const k = 255 / Math.max(1, hi - lo); for (let j = 0; j < g.length; j++) g[j] = Math.max(0, Math.min(255, (g[j] - lo) * k)); return g; }
+  function minMaxFilter(m, w, h, rx, ry, isMax) {                          // 이진 팽창(max) · 침식(min), 가로 → 세로
+    const t = new Uint8Array(w * h), o = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = isMax ? 0 : 1; for (let k = Math.max(0, x - rx); k <= Math.min(w - 1, x + rx); k++) { const q = m[y * w + k]; if (isMax ? q : !q) { v = isMax ? 1 : 0; break; } } t[y * w + x] = v; }
+    for (let x = 0; x < w; x++) for (let y = 0; y < h; y++) { let v = isMax ? 0 : 1; for (let k = Math.max(0, y - ry); k <= Math.min(h - 1, y + ry); k++) { const q = t[k * w + x]; if (isMax ? q : !q) { v = isMax ? 1 : 0; break; } } o[y * w + x] = v; }
+    return o;
+  }
+  function components(m, w, h) {                                          // 4-이웃 연결 요소 → 라벨(0 = 배경)
+    const lab = new Int32Array(w * h); let n = 0; const st = [];
+    for (let i = 0; i < m.length; i++) {
+      if (!m[i] || lab[i]) continue; n++; lab[i] = n; st.push(i);
+      while (st.length) { const p = st.pop(), x = p % w, y = (p / w) | 0;
+        if (x > 0 && m[p - 1] && !lab[p - 1]) { lab[p - 1] = n; st.push(p - 1); }
+        if (x < w - 1 && m[p + 1] && !lab[p + 1]) { lab[p + 1] = n; st.push(p + 1); }
+        if (y > 0 && m[p - w] && !lab[p - w]) { lab[p - w] = n; st.push(p - w); }
+        if (y < h - 1 && m[p + w] && !lab[p + w]) { lab[p + w] = n; st.push(p + w); } }
+    }
+    return { lab, n };
+  }
+  function fillBoxes(w, h, boxes, scale, grow = 0) {                      // 상자들을 채운 마스크(0/1)
+    const c = mk(w, h), x = ctx2(c); x.fillStyle = "#fff";
+    for (const b of boxes) { const p = boxPoints(b, grow).map(([u, v]) => [u * scale, v * scale]); x.beginPath(); x.moveTo(p[0][0], p[0][1]); for (let k = 1; k < 4; k++) x.lineTo(p[k][0], p[k][1]); x.closePath(); x.fill(); }
+    const d = x.getImageData(0, 0, w, h).data, m = new Uint8Array(w * h);
+    for (let i = 0, j = 0; j < m.length; i += 4, j++) m[j] = d[i] > 127 ? 1 : 0;
+    return m;
+  }
+
+  // ── 최소 넓이 회전 사각형(볼록 껍질 + 회전 캘리퍼) ──────────────────────────
+  function hull(pts) {
+    pts = pts.slice().sort((p, q) => p[0] - q[0] || p[1] - q[1]);
+    const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lo = [], up = [];
+    for (const p of pts) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+    for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+    return lo.slice(0, -1).concat(up.slice(0, -1));
+  }
+  function minAreaRect(pts) {
+    const H = hull(pts);
+    if (H.length < 3) { const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]); return { cx: (Math.min(...xs) + Math.max(...xs)) / 2, cy: (Math.min(...ys) + Math.max(...ys)) / 2, w: Math.max(...xs) - Math.min(...xs) + 1, h: Math.max(...ys) - Math.min(...ys) + 1, a: 0 }; }
+    let best = null;
+    for (let i = 0; i < H.length; i++) {
+      const p = H[i], q = H[(i + 1) % H.length], th = Math.atan2(q[1] - p[1], q[0] - p[0]), c = Math.cos(th), s = Math.sin(th);
+      let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      for (const [x, y] of H) { const u = x * c + y * s, v = -x * s + y * c; if (u < x0) x0 = u; if (u > x1) x1 = u; if (v < y0) y0 = v; if (v > y1) y1 = v; }
+      const area = (x1 - x0) * (y1 - y0);
+      if (!best || area < best.area) { const mu = (x0 + x1) / 2, mv = (y0 + y1) / 2; best = { area, cx: mu * c - mv * s, cy: mu * s + mv * c, w: x1 - x0 + 1, h: y1 - y0 + 1, a: th }; }
+    }
+    best.a = normA(best.a);
+    return best;
+  }
+
+  // ── 글줄 검출(DB) ──────────────────────────────────────────────────────────
+  async function detect(src, S, maxSide = 1600) {
+    const W = src.width, H = src.height, k = Math.min(1, maxSide / Math.max(W, H));
+    const w = Math.max(32, Math.round((W * k) / 32) * 32), h = Math.max(32, Math.round((H * k) / 32) * 32);
+    const c = mk(w, h); ctx2(c).drawImage(src, 0, 0, w, h);
+    const d = ctx2(c).getImageData(0, 0, w, h).data, n = w * h, x = new Float32Array(3 * n);
+    // PaddleOCR 은 BGR 순서 · mean(0.485, 0.456, 0.406) · std(0.229, 0.224, 0.225) — 시험판(cv2)과 같게
+    for (let i = 0, j = 0; j < n; i += 4, j++) { x[j] = (d[i + 2] / 255 - 0.485) / 0.229; x[n + j] = (d[i + 1] / 255 - 0.456) / 0.224; x[2 * n + j] = (d[i] / 255 - 0.406) / 0.225; }
+    const out = await S.det.run({ x: new ort.Tensor("float32", x, [1, 3, h, w]) });
+    const prob = out[Object.keys(out)[0]].data;
+    const bin = new Uint8Array(n); for (let j = 0; j < n; j++) bin[j] = prob[j] > 0.3 ? 1 : 0;
+    const { lab, n: cnt } = components(bin, w, h);
+    const pts = Array.from({ length: cnt + 1 }, () => []), sum = new Float32Array(cnt + 1), num = new Uint32Array(cnt + 1);
+    for (let j = 0; j < n; j++) { const l = lab[j]; if (!l) continue; sum[l] += prob[j]; num[l]++;
+      const xx = j % w, yy = (j / w) | 0;                                  // 경계 화소만 껍질 후보로
+      if (xx === 0 || yy === 0 || xx === w - 1 || yy === h - 1 || !bin[j - 1] || !bin[j + 1] || !bin[j - w] || !bin[j + w]) pts[l].push([xx, yy]); }
+    const sx = W / w, sy = H / h, boxes = [];
+    for (let l = 1; l <= cnt; l++) {
+      if (num[l] < 12 || sum[l] / num[l] < 0.5) continue;
+      const r = minAreaRect(pts[l]); const e = Math.min(r.w, r.h) * 0.3 + 1;   // unclip ≈ 1.6
+      boxes.push({ cx: r.cx * sx, cy: r.cy * sy, w: (r.w + 2 * e) * sx, h: (r.h + 2 * e) * sy, a: r.a, score: sum[l] / num[l] });
+    }
+    return boxes;
+  }
+  // 상자의 긴 변이 세로인가(화면 기준 투영 크기로)
+  function longVertical(b) { const p = boxPoints(b), xs = p.map((q) => q[0]), ys = p.map((q) => q[1]); return Math.max(...ys) - Math.min(...ys) > Math.max(...xs) - Math.min(...xs); }
+  function longAngleDeg(b) { let a = b.w >= b.h ? b.a : b.a + Math.PI / 2; a = ((a / DEG + 90) % 180 + 180) % 180 - 90; return a; }
+  async function is180(src, boxes, S) {
+    let votes = 0;
+    const pick = boxes.slice().sort((p, q) => q.w * q.h - p.w * p.h).slice(0, 24);
+    for (const b of pick) {
+      const c = rectCrop(src, b); if (c.width < c.height * 1.5) continue;
+      const t = mk(192, 48); ctx2(t).drawImage(c, 0, 0, 192, 48);
+      const d = ctx2(t).getImageData(0, 0, 192, 48).data, n = 192 * 48, x = new Float32Array(3 * n);
+      for (let i = 0, j = 0; j < n; i += 4, j++) { x[j] = (d[i + 2] / 255 - 0.5) / 0.5; x[n + j] = (d[i + 1] / 255 - 0.5) / 0.5; x[2 * n + j] = (d[i] / 255 - 0.5) / 0.5; }
+      const o = await S.cls.run({ x: new ort.Tensor("float32", x, [1, 3, 48, 192]) }); const p = o[Object.keys(o)[0]].data;
+      votes += p[1] > p[0] ? 1 : -1;
+    }
+    return votes > 0;
+  }
+
+  // ── 영수증 나누기 ──────────────────────────────────────────────────────────
+  const dist = (b, c) => Math.hypot(b.cx - c.cx, b.cy - c.cy);
+  function attach(rest, big) { for (const b of rest) { let k = 0, best = Infinity; big.forEach((g, i) => { for (const c of g) { const d = dist(b, c); if (d < best) { best = d; k = i; } } }); big[k].push(b); } }
+  function paperGroups(src, boxes) {
+    const W = src.width, H = src.height, s = 1000 / Math.max(W, H), w = Math.round(W * s), h = Math.round(H * s);
+    const c = mk(w, h); ctx2(c).drawImage(src, 0, 0, w, h);
+    const d = ctx2(c).getImageData(0, 0, w, h).data, V = new Float32Array(w * h), Sa = new Float32Array(w * h);
+    for (let i = 0, j = 0; j < V.length; i += 4, j++) { const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]); V[j] = mx; Sa[j] = mx ? ((mx - mn) / mx) * 255 : 0; }
+    const v = boxBlur(boxBlur(V, w, h, 2), w, h, 2), sat = boxBlur(boxBlur(Sa, w, h, 2), w, h, 2);
+    // Otsu
+    const hist = new Float64Array(256); for (const q of v) hist[Math.max(0, Math.min(255, q | 0))]++;
+    let tot = v.length, sumAll = 0; for (let t = 0; t < 256; t++) sumAll += t * hist[t];
+    let wB = 0, sB = 0, best = -1, th = 128;
+    for (let t = 0; t < 256; t++) { wB += hist[t]; if (!wB) continue; const wF = tot - wB; if (!wF) break; sB += t * hist[t]; const mB = sB / wB, mF = (sumAll - sB) / wF, bv = wB * wF * (mB - mF) ** 2; if (bv > best) { best = bv; th = t; } }
+    const fill = fillBoxes(w, h, boxes, s);
+    let m = new Uint8Array(w * h); for (let j = 0; j < m.length; j++) m[j] = (v[j] > th && sat[j] < 70) || fill[j] ? 1 : 0;
+    m = minMaxFilter(minMaxFilter(m, w, h, 4, 4, false), w, h, 4, 4, true);   // 열기 9×9 — 가는 다리 끊기
+    const { lab } = components(m, w, h), by = new Map();
+    for (const b of boxes) { const x = Math.min(w - 1, Math.max(0, Math.round(b.cx * s))), y = Math.min(h - 1, Math.max(0, Math.round(b.cy * s))); const g = lab[y * w + x]; if (!by.has(g)) by.set(g, []); by.get(g).push(b); }
+    const big = [], rest = [];
+    for (const [g, v2] of by) (g && v2.length >= 6 ? big : rest).push(...(g && v2.length >= 6 ? [v2] : v2));
+    if (!big.length) return [];
+    attach(rest, big);                                                       // 그림자 속 글줄도 버리지 않는다
+    return big.sort((p, q) => Math.min(...p.map((b) => b.cx)) - Math.min(...q.map((b) => b.cx)));
+  }
+  function textGroups(boxes, W, H) {
+    const s = 1000 / Math.max(W, H), w = Math.round(W * s), h = Math.round(H * s);
+    const mh = median(boxes.map(shortSide)) * s || 8;
+    const m = minMaxFilter(fillBoxes(w, h, boxes, s), w, h, Math.max(1, Math.round(mh * 1.1)), Math.max(1, Math.round(mh * 1.3)), true);
+    const { lab } = components(m, w, h), by = new Map();
+    for (const b of boxes) { const x = Math.min(w - 1, Math.max(0, Math.round(b.cx * s))), y = Math.min(h - 1, Math.max(0, Math.round(b.cy * s))); const g = lab[y * w + x]; if (!by.has(g)) by.set(g, []); by.get(g).push(b); }
+    return [...by.values()].filter((v) => v.length >= 6).sort((p, q) => Math.min(...p.map((b) => b.cx)) - Math.min(...q.map((b) => b.cx)));
+  }
+  function median(a) { if (!a.length) return 0; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; }
+  /* 한 종이 영역 안에 붙은 영수증 나누기 — 어떤 글줄도 가로지르지 않는 「빈 띠」 로 가른다.
+     나란한 두 영수증 사이에는 위아래 끝까지 이어진 빈 띠가 있고, 한 영수증 안의 라벨 · 오른쪽 금액 사이는
+     폭 전체를 쓰는 줄(주소 · 구분선 등)이 가로질러 빈 띠가 생기지 않는다. 팽창 크기에 기대던 예전 방식은
+     상자 두께가 7% 달라지는 것만으로 붙어 버렸다(시험에서 확인). 두 쪽이 모두 영수증다워야(글줄 10개 이상 ·
+     길이 방향으로 절반 이상) 나눈다 — 금액 열 같은 조각은 제자리에 둔다. */
+  function gapSplit(g) {
+    const mh = median(g.map(shortSide)) || 10;
+    // 좌우로 나란한 경우만 — 영수증 안에도 단락 사이 가로 빈 띠가 있어 위아래로 가르면 한 장이 여러 조각이 된다(시험에서 확인).
+    // 위아래로 놓인 영수증은 사이에 배경이 보여 종이 단위 묶기에서 이미 갈린다.
+    for (const ax of [0]) {
+      const ext = g.map((b) => { const p = boxPoints(b).map((q) => q[ax]); return [Math.min(...p), Math.max(...p), b]; }).sort((p, q) => p[0] - q[0]);
+      let end = ext[0][1], cands = [];
+      for (let i = 1; i < ext.length; i++) { if (ext[i][0] - end >= 0.8 * mh) cands.push({ at: (end + ext[i][0]) / 2, gap: ext[i][0] - end }); end = Math.max(end, ext[i][1]); }
+      cands.sort((p, q) => q.gap - p.gap);
+      const o = 1 - ax, span = (v) => { const c = v.map((b) => (o ? b.cy : b.cx)); return Math.max(...c) - Math.min(...c); }, spanG = span(g);
+      for (const c of cands) {
+        const A = g.filter((b) => (ax ? b.cy : b.cx) < c.at), B = g.filter((b) => (ax ? b.cy : b.cx) >= c.at);
+        const ok = (v) => v.length >= 10 && span(v) > 0.5 * spanG;
+        if (ok(A) && ok(B)) return [...gapSplit(A), ...gapSplit(B)];
+      }
+    }
+    return [g];
+  }
+  function splitGroups(gs) { return gs.flatMap(gapSplit); }
+
+
+  // ── 읽을 이미지 ① 영역 ② 글줄 시트 ────────────────────────────────────────
+  function bounds(bs, grow = 20, W = Infinity, H = Infinity) {
+    const p = bs.flatMap((b) => boxPoints(b)); const xs = p.map((q) => q[0]), ys = p.map((q) => q[1]);
+    const x0 = Math.max(0, Math.floor(Math.min(...xs) - grow)), y0 = Math.max(0, Math.floor(Math.min(...ys) - grow));
+    return { x0, y0, x1: Math.min(W, Math.ceil(Math.max(...xs) + grow)), y1: Math.min(H, Math.ceil(Math.max(...ys) + grow)) };
+  }
+  function regionImage(src, bs) {
+    const r = bounds(bs, 20, src.width, src.height), w = r.x1 - r.x0, h = r.y1 - r.y0;
+    const c = mk(w, h); ctx2(c).drawImage(src, r.x0, r.y0, w, h, 0, 0, w, h);
+    let g = grayOf(c); const rr = Math.max(12, Math.round(w / 56)), bg = boxBlur(g, w, h, rr);
+    for (let j = 0; j < g.length; j++) g[j] = Math.min(255, (g[j] / (bg[j] + 1)) * 255);
+    g = stretch(g, percentile(g, 0.02), Math.max(percentile(g, 0.02) + 1, percentile(g, 0.98)));
+    const moved = bs.map((b) => ({ ...b, cx: b.cx - r.x0, cy: b.cy - r.y0 }));
+    const keep = fillBoxes(w, h, moved.map((b) => ({ ...b, w: b.w + shortSide(b) * 0.35, h: b.h + shortSide(b) * 0.35 })), 1);
+    for (let j = 0; j < g.length; j++) if (!keep[j]) g[j] = 255;               // 글줄 밖은 흰색 — 배경 무늬 제거
+    const k = 44 / Math.max(8, median(bs.map(shortSide)));
+    const base = putGray(g, w, h), out = mk(w * k, h * k); const x = ctx2(out); x.imageSmoothingQuality = "high"; x.drawImage(base, 0, 0, out.width, out.height);
+    return { canvas: out, k, x0: r.x0, y0: r.y0 };
+  }
+  function rowsOf(bs) {
+    const it = bs.map((b) => ({ b, cy: b.cy, h: shortSide(b), cx: b.cx })).sort((p, q) => p.cy - q.cy), rows = [];
+    for (const x of it) { const r = rows.find((r) => Math.abs(r.cy - x.cy) < 0.55 * Math.min(r.h, x.h)); if (r) { r.items.push(x); r.cy = r.items.reduce((s, q) => s + q.cy, 0) / r.items.length; } else rows.push({ cy: x.cy, h: x.h, items: [x] }); }
+    rows.forEach((r) => r.items.sort((p, q) => p.cx - q.cx));
+    return rows.sort((p, q) => p.cy - q.cy);
+  }
+  function sheetImage(src, bs, H = 46, gapX = 36, gapY = 22) {
+    const rows = rowsOf(bs), strips = [];
+    for (const r of rows) {
+      const parts = [];
+      for (const { b } of r.items) {
+        const c = rectCrop(src, b, 0.18); const k = H / Math.max(1, c.height), w = Math.max(1, Math.round(c.width * k));
+        const t = mk(w, H); const x = ctx2(t); x.imageSmoothingQuality = "high"; x.drawImage(c, 0, 0, w, H);
+        let g = grayOf(t); g = stretch(g, percentile(g, 0.03), Math.max(percentile(g, 0.03) + 1, percentile(g, 0.97)));   // 조각마다 대비 — 그림자 쪽도 같게
+        parts.push(putGray(g, w, H));
+      }
+      if (!parts.length) continue;
+      const w = parts.reduce((s, p) => s + p.width, 0) + gapX * (parts.length - 1), st = mk(w, H), x = ctx2(st);
+      x.fillStyle = "#fff"; x.fillRect(0, 0, w, H); let px = 0; for (const p of parts) { x.drawImage(p, px, 0); px += p.width + gapX; }
+      const bb = bounds(r.items.map((q) => q.b), 2);
+      strips.push({ c: st, box: bb });
+    }
+    const W = Math.max(...strips.map((s) => s.c.width)) + 40, Ht = strips.reduce((s, q) => s + q.c.height + gapY, 0) + 40;
+    const sh = mk(W, Ht), x = ctx2(sh); x.fillStyle = "#fff"; x.fillRect(0, 0, W, Ht);
+    let y = 20; const rowsOut = [];
+    for (const s of strips) { x.drawImage(s.c, 20, y); rowsOut.push({ y0: y, y1: y + s.c.height, box: s.box }); y += s.c.height + gapY; }
+    return { canvas: sh, rows: rowsOut };
+  }
+
+  // ── 본체 — 사진 한 장 → 영수증들 ───────────────────────────────────────────
+  async function analyze(file, opt = {}) {
+    const S = await sessions(opt.modelBase || "models/");
+    const say = opt.onStep || (() => {});
+    say("영수증을 찾는 중…");
+    const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+    const k = Math.min(1, (opt.maxSide || 3200) / Math.max(bmp.width, bmp.height));
+    let img = mk(bmp.width * k, bmp.height * k); ctx2(img).drawImage(bmp, 0, 0, img.width, img.height);
+    let boxes = await detect(img, S);
+    if (!boxes.length) return { receipts: [], image: img };
+    say("방향을 맞추는 중…");
+    if (boxes.filter(longVertical).length > boxes.length / 2) { img = rotateCanvas(img, 90); boxes = await detect(img, S); }
+    if (await is180(img, boxes, S)) { img = rotateCanvas(img, 180); boxes = await detect(img, S); }
+    const angs = boxes.filter((b) => Math.max(b.w, b.h) > 3 * Math.min(b.w, b.h)).map(longAngleDeg).filter((a) => Math.abs(a) < 15);
+    const skew = median(angs);
+    if (Math.abs(skew) > 0.7) { img = rotateCanvas(img, -skew); boxes = await detect(img, S); }
+    let gs = paperGroups(img, boxes); if (!gs.length) gs = textGroups(boxes, img.width, img.height); if (!gs.length) gs = [boxes];
+    gs = splitGroups(gs);
+    const receipts = gs.map((bs) => {
+      const vb = bounds(bs, 30, img.width, img.height), vw = vb.x1 - vb.x0, vh = vb.y1 - vb.y0;
+      const view = mk(vw, vh); ctx2(view).drawImage(img, vb.x0, vb.y0, vw, vh, 0, 0, vw, vh);   // 리뷰 화면 · 저장용(바로 세운 컬러 영수증)
+      return { boxes: bs, view, viewBox: vb, region: regionImage(img, bs), sheet: sheetImage(img, bs) };
+    });
+    return { receipts, image: img };
+  }
+
+  const api = { analyze, minAreaRect, hull, rowsOf, median };
+  root.ReceiptVision = api;
 })(typeof window !== "undefined" ? window : globalThis);
 
 </script>
@@ -580,13 +1023,15 @@
   }
   /* 영수증 한 건을 SharePoint 에 — 폴더 하나에 원본 사진과 리뷰 결과(JSON).
      OCR_AttachedFiles / YYYY-MM / YYYYMMDD-HHmmss_아이디_상호 / receipt.<확장자> · result.json */
-  async function saveToSharePoint(rec, file) {
+  async function saveToSharePoint(rec, file, crop) {
     const now = new Date(rec.reviewedAt);
     const k = new Date(now.getTime() + 9 * 3600 * 1000).toISOString();   // 폴더 이름은 한국 시간
     const stamp = k.slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
-    const folder = `${ROOT_FOLDER}/${k.slice(0, 7)}/${stamp}_${safeSeg((user.username || "").split("@")[0])}_${safeSeg(rec.fields.storeName)}`;
+    // 한 사진에 같은 가게 영수증이 여러 장일 수 있어(GS25 두 장) 영수증 번호 · 고유 끝자리로 폴더가 겹치지 않게
+    const folder = `${ROOT_FOLDER}/${k.slice(0, 7)}/${stamp}_${safeSeg((user.username || "").split("@")[0])}_${safeSeg(rec.fields.storeName)}_${(rec.photo && rec.photo.of > 1) ? rec.photo.index + "of" + rec.photo.of + "_" : ""}${String(rec.id).slice(-4)}`;
     const ext = ((file && file.name.match(/\.([a-z0-9]{2,5})$/i)) || [, "jpg"])[1].toLowerCase();
-    if (file) await upload(`${folder}/receipt.${ext}`, file, file.type);
+    if (crop) await upload(`${folder}/receipt.jpg`, crop, "image/jpeg");            // 바로 세운 영수증
+    if (file) await upload(`${folder}/original.${ext}`, file, file.type);        // 원본 사진
     await upload(`${folder}/result.json`, new Blob([JSON.stringify(rec, null, 2)], { type: "application/json" }), "application/json");
     return { folder, webUrl: await folderUrl(folder) };
   }
@@ -616,34 +1061,6 @@
   function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("on"), 2200); }
   function progress(p, label) { $("prog").style.display = "block"; $("progBar").style.width = Math.round(p * 100) + "%"; $("progLbl").textContent = label; }
 
-  // ── 이미지 보정 — 조명 평탄화 + 대비 늘리기(시험에서 신뢰도 65~70 → 85~90) ─────────
-  async function preprocess(file) {
-    const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
-    const target = Math.min(2200, Math.max(1400, bmp.width));
-    const scale = target / bmp.width;
-    const w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
-    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
-    const cx = cv.getContext("2d", { willReadFrequently: true });
-    cx.drawImage(bmp, 0, 0, w, h);
-    const img = cx.getImageData(0, 0, w, h), d = img.data;
-    const g = new Float32Array(w * h);
-    for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    // 배경 = 넓은 상자 흐림(가로 · 세로 누적합). 글자는 사라지고 조명만 남는다.
-    const r = Math.max(12, Math.round(w / 56));
-    const tmp = new Float32Array(w * h), bg = new Float32Array(w * h);
-    for (let y = 0; y < h; y++) { let s = 0; const o = y * w;
-      for (let x = -r; x < w; x++) { if (x + r < w) s += g[o + x + r]; if (x - r - 1 >= 0) s -= g[o + x - r - 1]; if (x >= 0) tmp[o + x] = s / (Math.min(w - 1, x + r) - Math.max(0, x - r) + 1); } }
-    for (let x = 0; x < w; x++) { let s = 0;
-      for (let y = -r; y < h; y++) { if (y + r < h) s += tmp[(y + r) * w + x]; if (y - r - 1 >= 0) s -= tmp[(y - r - 1) * w + x]; if (y >= 0) bg[y * w + x] = s / (Math.min(h - 1, y + r) - Math.max(0, y - r) + 1); } }
-    const hist = new Uint32Array(256);
-    for (let j = 0; j < g.length; j++) { const v = Math.min(255, (g[j] / (bg[j] + 1)) * 255); g[j] = v; hist[v | 0]++; }
-    const pct = (p) => { let c = 0, n = g.length * p; for (let v = 0; v < 256; v++) { c += hist[v]; if (c >= n) return v; } return 255; };
-    const lo = pct(0.02), hi = Math.max(lo + 1, pct(0.98));
-    for (let i = 0, j = 0; i < d.length; i += 4, j++) { const v = Math.max(0, Math.min(255, ((g[j] - lo) / (hi - lo)) * 255)); d[i] = d[i + 1] = d[i + 2] = v; }
-    cx.putImageData(img, 0, 0);
-    return { canvas: cv, width: w, height: h };
-  }
-
   async function getWorker() {
     if (worker) return worker;
     worker = await Tesseract.createWorker(["kor", "eng"], 1, {
@@ -667,29 +1084,50 @@
     }
   }
 
+  let PHOTO = null;          // { file, name, receipts: [ S … ] } — 한 사진에서 찾은 영수증들
   async function handleFile(file) {
     if (!file || !/^image\//.test(file.type)) { toast("이미지 파일을 올려 주세요."); return; }
     $("review").innerHTML = '<div class="empty">인식하는 중입니다…</div>';
-    $("imgbox").style.display = "block"; $("hl").style.display = "none";
+    $("imgbox").style.display = "block"; $("hl").style.display = "none"; $("origWrap").hidden = true;
     $("img").src = URL.createObjectURL(file);
     try {
-      progress(0.02, "이미지를 보정하는 중…");
-      const pre = await preprocess(file);
-      const w = await getWorker();
-      progress(0.35, "글자를 읽는 중…");
-      const { data } = await w.recognize(pre.canvas);
-      const lines = data.lines.map((l) => ({ text: l.text, conf: l.confidence, bbox: l.bbox }));
-      const r = P.parseReceipt(lines);
-      maskCard(r.fields);
-      S = { name: file.name, file, fields: r.fields, items: r.items, lines: r.lines, procW: pre.width, acked: new Set(), edited: new Set(), checksAck: false };
-      $("rawText").textContent = data.text; $("raw").hidden = false;
-      progress(1, `완료 — 줄 ${lines.length}개 · 전체 인식 신뢰도 ${Math.round(data.confidence)}`);
-      renderReview();
+      progress(0.02, "모델을 준비하는 중… (처음 한 번은 조금 걸립니다)");
+      const A = await ReceiptVision.analyze(file, { modelBase: OCR_PATHS.modelBase || "models/", onStep: (t) => progress(0.08, t) });
+      if (!A.receipts.length) throw new Error("사진에서 글자를 찾지 못했습니다. 영수증이 잘 보이게 다시 찍어 주세요.");
+      const w = await getWorker(), n = A.receipts.length, out = [];
+      for (let i = 0; i < n; i++) {
+        const R = A.receipts[i], base = 0.12 + (i / n) * 0.86, step = 0.86 / n;
+        progress(base, `영수증 ${i + 1}/${n} 읽는 중… (1차)`);
+        const ra = (await w.recognize(R.region.canvas)).data;
+        progress(base + step / 2, `영수증 ${i + 1}/${n} 읽는 중… (2차 — 글줄 단위로 다시)`);
+        const rb = (await w.recognize(R.sheet.canvas)).data;
+        const vx = R.viewBox.x0, vy = R.viewBox.y0;
+        // ① 영역 읽기 — 확대 비율을 되돌려 바로 세운 영수증 좌표로
+        const la = ra.lines.map((l) => ({ text: l.text, conf: l.confidence, bbox: { x0: R.region.x0 + l.bbox.x0 / R.region.k - vx, y0: R.region.y0 + l.bbox.y0 / R.region.k - vy, x1: R.region.x0 + l.bbox.x1 / R.region.k - vx, y1: R.region.y0 + l.bbox.y1 / R.region.k - vy } }));
+        // ② 글줄 시트 — 시트의 줄 위치로 원래 줄(검출 상자 묶음)을 찾는다
+        const lb = rb.lines.map((l) => { const cy = (l.bbox.y0 + l.bbox.y1) / 2; const row = R.sheet.rows.find((r) => cy >= r.y0 - 11 && cy <= r.y1 + 11) || R.sheet.rows.reduce((p, q) => (Math.abs((q.y0 + q.y1) / 2 - cy) < Math.abs((p.y0 + p.y1) / 2 - cy) ? q : p));
+          return { text: l.text, conf: l.confidence, bbox: { x0: row.box.x0 - vx, y0: row.box.y0 - vy, x1: row.box.x1 - vx, y1: row.box.y1 - vy } }; });
+        const m = P.mergeReadings(P.parseReceipt(la), P.parseReceipt(lb));
+        maskCard(m.fields);
+        out.push({ name: file.name, file, n: i + 1, of: n, img: R.view.toDataURL("image/jpeg", 0.88), viewW: R.view.width,
+          fields: m.fields, items: m.items, lines: m.lines, lines2: m.lines2, raw: ra.text + "\n\n── 2차(글줄 단위) ──\n" + rb.text,
+          conf: [Math.round(ra.confidence), Math.round(rb.confidence)], acked: new Set(), edited: new Set(), checksAck: false, done: false });
+      }
+      PHOTO = { file, name: file.name, receipts: out };
+      $("origLink").href = URL.createObjectURL(file); $("origWrap").hidden = false;
+      progress(1, `완료 — 영수증 ${n}장 · 인식 신뢰도 ${out.map((r) => r.conf.join("/")).join(", ")}`);
+      showReceipt(0);
     } catch (e) {
       console.error(e);
       progress(0, "인식에 실패했습니다: " + e.message);
       $("review").innerHTML = `<div class="empty">인식에 실패했습니다. 다시 시도해 주세요.<br><small>${esc(e.message)}</small></div>`;
     }
+  }
+  function showReceipt(i) {
+    S = PHOTO.receipts[i];
+    $("img").src = S.img; $("hl").style.display = "none";
+    $("rawText").textContent = S.raw; $("raw").hidden = false;
+    renderReview();
   }
 
   // ── 리뷰 화면 ─────────────────────────────────────────────────────────────
@@ -709,7 +1147,8 @@
     const right = st === "warn"
       ? `<span class="st warn"><button class="ackbtn" data-ack="${k}" type="button">확인</button></span>`
       : `<span class="st ${st}"><span class="dot"></span>${ST_TXT[st]}</span>`;
-    const why = st === "warn" && f.suspect ? `<div class="why">⚠ ${esc(f.suspect.join(" · "))}</div>` : "";
+    const alt = f.alt != null && f.alt !== "" && !S.edited.has(k) ? `<button class="altbtn" data-alt="${k}" type="button" title="다른 방식으로 읽은 값으로 바꾸기">다른 값: ${esc(f.alt)}</button>` : "";
+    const why = st === "warn" && f.suspect ? `<div class="why">⚠ ${esc(f.suspect.join(" · "))}${alt}</div>` : alt ? `<div class="why" style="color:var(--muted)">${alt}</div>` : "";
     return `<div class="fld ${st === "warn" ? "warn" : st === "none" ? "none" : ""}" data-k="${k}">
       <label for="f_${k}">${esc(label)}${REQUIRED.includes(k) ? ' <span style="color:#e11d48">*</span>' : ""}</label>
       <input id="f_${k}" data-f="${k}" value="${esc(f.value || "")}" autocomplete="off">
@@ -719,7 +1158,10 @@
   function renderReview() {
     const counts = { ok: 0, warn: 0, none: 0 };
     P.FIELD_GROUPS.forEach((g) => g.fields.forEach(([k]) => { const s = statusOf(k); if (s === "warn") counts.warn++; else if (s === "none") counts.none++; else counts.ok++; }));
-    let h = `<div class="sumbar"><span class="pill ok">채움 ${counts.ok}</span><span class="pill warn">확인 필요 ${counts.warn}</span><span class="pill none">미인식 ${counts.none}</span></div>`;
+    let h = PHOTO && PHOTO.receipts.length > 1
+      ? `<div class="tabs">${PHOTO.receipts.map((r, i) => `<button class="tab ${r === S ? "on" : ""} ${r.done ? "done" : ""}" data-tab="${i}" type="button">${r.done ? "✓ " : ""}영수증 ${i + 1}${r.fields.storeName ? " · " + esc(String(r.fields.storeName.value).slice(0, 10)) : ""}</button>`).join("")}</div>
+         <div style="font-size:.74rem;color:var(--muted);margin:-4px 0 10px">이 사진에서 영수증 ${PHOTO.receipts.length}장을 찾았습니다 — 한 장씩 확인하고 확정해 주세요.</div>` : "";
+    h += `<div class="sumbar"><span class="pill ok">채움 ${counts.ok}</span><span class="pill warn">확인 필요 ${counts.warn}</span><span class="pill none">미인식 ${counts.none}</span></div>`;
     for (const g of P.FIELD_GROUPS) {
       // 빈 칸뿐인 묶음(예: 카드 결제인데 현금 · 계좌)은 접어서 아래에
       const any = g.fields.some(([k]) => S.fields[k] && S.fields[k].value);
@@ -763,11 +1205,11 @@
   }
 
   // 원본에서 그 줄 짚기
-  function highlight(lineIdx) {
+  function highlight(lineIdx, src) {
     const hl = $("hl"), img = $("img");
-    const l = S && S.lines.find((x) => x.i === lineIdx);
+    const l = S && lineIdx != null && (src === "b" ? S.lines2 : S.lines).find((x) => x.i === lineIdx);
     if (!l || !l.bbox || !img.naturalWidth) { hl.style.display = "none"; return; }
-    const k = img.clientWidth / S.procW, pad = 3;
+    const k = img.clientWidth / S.viewW, pad = 3;
     Object.assign(hl.style, { display: "block", left: (l.bbox.x0 * k - pad) + "px", top: (l.bbox.y0 * k - pad) + "px", width: ((l.bbox.x1 - l.bbox.x0) * k + pad * 2) + "px", height: ((l.bbox.y1 - l.bbox.y0) * k + pad * 2) + "px" });
     const box = $("imgbox").getBoundingClientRect(), y = box.top + l.bbox.y0 * k;
     if (y < 0 || y > window.innerHeight) hl.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -776,8 +1218,8 @@
   // ── 이벤트 ────────────────────────────────────────────────────────────────
   $("review").addEventListener("focusin", (e) => {
     const k = e.target.dataset.f, i = e.target.dataset.it;
-    if (k && S.fields[k]) highlight(S.fields[k].line);
-    else if (i != null && S.items[i]) highlight(S.items[i].line);
+    if (k && S.fields[k]) highlight(S.fields[k].line, S.fields[k].src);
+    else if (i != null && S.items[i]) highlight(S.items[i].line, S.items[i].src);
   });
   $("review").addEventListener("input", (e) => {
     const k = e.target.dataset.f;
@@ -793,6 +1235,9 @@
   });
   $("review").addEventListener("change", (e) => { if (e.target.id === "ackChecks") { S.checksAck = e.target.checked; renderChecks(); } });
   $("review").addEventListener("click", (e) => {
+    if (e.target.dataset.tab != null) { showReceipt(Number(e.target.dataset.tab)); return; }
+    const altK = e.target.dataset.alt;
+    if (altK) { const f = S.fields[altK]; const v = f.value; f.value = f.alt; f.alt = v; S.edited.add(altK); renderReview(); document.querySelector(`[data-f="${altK}"]`)?.focus(); return; }
     const ack = e.target.dataset.ack;
     if (ack) { S.acked.add(ack); renderReview(); document.querySelector(`[data-f="${ack}"]`)?.focus(); return; }
     if (e.target.dataset.del != null) { S.items.splice(Number(e.target.dataset.del), 1); renderReview(); return; }
@@ -806,9 +1251,11 @@
       reviewer: { name: user && user.name, email: user && user.username }, fields: {},
       items: S.items.map(({ name, unitPrice, qty, amount }) => ({ name, unitPrice, qty, amount })) };
     P.FIELD_GROUPS.forEach((g) => g.fields.forEach(([k]) => { rec.fields[k] = (S.fields[k] && S.fields[k].value) || ""; }));
+    rec.photo = { name: S.name, index: S.n, of: S.of };
     const btn = $("btnDone"); btn.disabled = true; btn.textContent = "SharePoint 에 저장하는 중…";
+    const cropBlob = await (await fetch(S.img)).blob();
     try {
-      const sp = await saveToSharePoint(rec, S.file);
+      const sp = await saveToSharePoint(rec, S.file, cropBlob);
       rec.sp = sp;
       toast("확정하고 SharePoint 에 저장했습니다.");
     } catch (e) {
@@ -817,13 +1264,17 @@
       alert("확정은 했지만 SharePoint 저장에 실패했습니다. 아래 목록에서 「다시 저장」 을 눌러 주세요.\n\n" + e.message);
     }
     // 다시 저장할 수 있게 원본 사진은 이 화면이 열려 있는 동안 메모리에 둔다(브라우저 저장소에는 넣지 않는다)
-    PENDING[rec.id] = S.file;
+    PENDING[rec.id] = { file: S.file, crop: cropBlob };
     const list = loadHist(); list.unshift(rec); saveHist(list);
-    renderHist(); resetInput();
+    renderHist();
+    S.done = true;
+    // 같은 사진의 남은 영수증으로 — 다 끝나면 처음 화면
+    const next = PHOTO && PHOTO.receipts.findIndex((r) => !r.done);
+    if (PHOTO && next >= 0) showReceipt(next); else resetInput();
   }
   const PENDING = {};
   function resetInput() {
-    S = null; $("review").innerHTML = '<div class="empty">영수증을 올리면 여기에 항목이 채워집니다.</div>';
+    S = null; PHOTO = null; $("origWrap").hidden = true; $("review").innerHTML = '<div class="empty">영수증을 올리면 여기에 항목이 채워집니다.</div>';
     $("imgbox").style.display = "none"; $("raw").hidden = true; $("prog").style.display = "none";
     $("fileCam").value = ""; $("fileAny").value = "";
   }
@@ -848,7 +1299,7 @@
     if (rid) {
       const list = loadHist(); const r = list.find((x) => String(x.id) === rid); if (!r) return;
       e.target.disabled = true; e.target.textContent = "저장 중…";
-      try { r.sp = await saveToSharePoint(r, PENDING[r.id] || null); delete r.spError; saveHist(list); toast(PENDING[r.id] ? "SharePoint 에 저장했습니다." : "SharePoint 에 저장했습니다(원본 사진은 새로고침 전에만 다시 올릴 수 있어 결과만 저장)."); }
+      try { const pd = PENDING[r.id] || {}; r.sp = await saveToSharePoint(r, pd.file || null, pd.crop || null); delete r.spError; saveHist(list); toast(PENDING[r.id] ? "SharePoint 에 저장했습니다." : "SharePoint 에 저장했습니다(사진은 새로고침 전에만 다시 올릴 수 있어 결과만 저장)."); }
       catch (err) { r.spError = err.message; saveHist(list); alert("SharePoint 저장에 실패했습니다.\n\n" + err.message); }
       renderHist(); return;
     }
@@ -881,7 +1332,7 @@
   drop.addEventListener("drop", (e) => handleFile(e.dataTransfer.files[0]));
   window.addEventListener("paste", (e) => { const f = [...(e.clipboardData?.files || [])].find((x) => /^image\//.test(x.type)); if (f) handleFile(f); });
   window.addEventListener("resize", () => $("hl").style.display = "none");
-  window.__ocrTest = { handleFile, state: () => S, _setAuth: (m, u) => { msalApp = m; user = u; }, saveToSharePoint };
+  window.__ocrTest = { handleFile, state: () => S, photo: () => PHOTO, _setAuth: (m, u) => { msalApp = m; user = u; }, saveToSharePoint };
   // 테스트에서는 로그인을 건너뛴다(window.__OCR_NOAUTH)
   if (window.__OCR_NOAUTH) { user = window.__OCR_NOAUTH; $("appView").hidden = false; renderHist(); }
   else boot().catch((e) => { $("loginView").hidden = false; $("loginErr").textContent = "초기화 실패: " + e.message; });
