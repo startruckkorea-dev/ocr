@@ -1,6 +1,6 @@
 # STK 영수증 OCR
 
-주소: https://ocr.startruckkorea.com/
+주소: https://ocr-image.startruckkorea.com/
 
 영수증을 촬영하거나 올리면 항목을 자동으로 채우고, 사람이 확인(리뷰)한 뒤 확정합니다.
 
