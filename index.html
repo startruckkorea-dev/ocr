@@ -113,6 +113,15 @@
   .saved { color: var(--ok); font-weight: 600; text-decoration: none; } .saved:hover { text-decoration: underline; }
   .unsaved { color: var(--bad); font-weight: 600; }
   footer { text-align: center; font-size: .7rem; color: var(--soft); padding: 18px 0 28px; }
+
+/* 스크롤 막대 — APS 공통(10-09 · aps-scrollbar). 브라우저 기본 막대(굵은 회색 · 양끝 화살표)가 표 아래 · 화면 옆에서 촌스럽게 튀어
+   ICS 와 같은 얇은 막대로 통일한다: 연회색 · 트랙 투명 · 화살표 없음(Chrome · Edge · Firefox 는 thin, Safari 는 8px 둥근 막대).
+   * 선택자는 우선순위가 가장 낮아, 막대를 숨겨 둔 곳(탭 줄 · 빠른 링크 줄 등)이나 따로 꾸민 곳은 그 규칙이 그대로 이긴다. */
+html, * { scrollbar-width: thin; scrollbar-color: #CBD5E1 transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: #94A3B8; background-clip: padding-box; }
 </style>
 </head>
 <body>
