@@ -127,7 +127,11 @@ html, * { scrollbar-width: thin; scrollbar-color: #CBD5E1 transparent; }
 /* APS 모바일(10-09 · aps-mobile) — 767px 이하 전용. 웹 화면 무변경 */
 /* OCR: 이미 모바일 대응(900 · 620px)이 있어 다듬기만. 620px 1열 규칙에서 .why(grid-column:2/4)가 암시적 열을 만들어
    라벨이 세로로 쪼개지던 것 · 왼쪽 카드 sticky 가 1열에서 리뷰 카드를 덮던 것 · 품목 표 상품명 칸이 좁던 것을 고친다. */
-@media (max-width: 767px) {
+@media screen and (max-width: 767px) {
+  /* ── 2차(10-10) iPhone · Galaxy 방어 — 글자 자동 확대 끔, 입력 · 단추가 부모 폭을 넘지 않게(날짜 입력칸 · 선택 칸 없음) ── */
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  input, select, textarea, button { max-width: 100%; box-sizing: border-box; }
+
   /* ── 머리띠 · 바깥 여백 ── */
   .top { padding: 12px; gap: 8px 10px; flex-wrap: wrap; }
   .top > div:first-child { flex: 1 1 auto; min-width: 0; }
@@ -166,6 +170,19 @@ html, * { scrollbar-width: thin; scrollbar-color: #CBD5E1 transparent; }
   table.items td { padding: 3px 2px; }
   table.items input { padding: 7px 5px; }
   .checks li { flex-wrap: wrap; row-gap: 2px; }
+  /* 「인식된 원문 보기」 — 폰에서는 상자 안 스크롤(260px) 대신 펼친 만큼 다 보이게(겹친 스크롤 상자는 손가락으로 다루기 어려움, 2차) */
+  details.raw pre { max-height: none; overflow: visible; overflow-wrap: anywhere; }
+  /* 480px 이하: 품목 한 줄을 두 줄로 — 위 상품명 꽉 채움, 아래 단가 · 수량 · 금액 · ×.
+     한 줄 4칸이면 단가 · 금액 칸이 60px 남짓이라 1,234,567 · 120 같은 값이 칸 안에서 잘려 보였다(2차) */
+  @media (max-width: 480px) {
+    table.items, table.items thead, table.items tbody { display: block; }
+    table.items tr { display: grid; grid-template-columns: minmax(0, 1fr) 48px minmax(0, 1fr) 26px; gap: 4px; align-items: center; padding: 6px 0; border-bottom: 1px solid #f3f2f1; }
+    table.items thead tr { background: #faf9f8; border-bottom: 1px solid var(--line); padding: 4px 6px; row-gap: 2px; }
+    table.items tr > th:nth-child(n), table.items tr > td:nth-child(n) { width: auto !important; padding: 0; border: 0; background: none; }
+    table.items tr > :first-child { grid-column: 1 / -1; }
+    table.items input { padding: 7px 4px; }
+    table.items td .x { width: 26px; min-height: 32px; }
+  }
 
   /* 확정 줄 — 안내 · 검산 확인은 위, 「다른 영수증」 · 「확정」 두 단추는 아래 줄 꽉 채움 */
   .done { gap: 8px; }
@@ -176,7 +193,8 @@ html, * { scrollbar-width: thin; scrollbar-color: #CBD5E1 transparent; }
   .card h2 { flex-wrap: wrap; row-gap: 8px; }
   .card h2 > span[style*="margin-left:auto"] { margin-left: 0 !important; flex: 1 1 100%; }
   .card h2 > span[style*="margin-left:auto"] .btn { flex: 1 1 auto; white-space: nowrap; padding: 4px 8px; }
-  table.hist td { white-space: nowrap; }
+  table.hist td { white-space: nowrap; height: 40px; padding-top: 5px; padding-bottom: 5px; }
+  table.hist .btn.sm { min-height: 30px; }   /* 「다시 저장」 있는 줄만 키가 커서 줄 높이가 들쭉날쭉하던 것 — 모든 줄 40px(2차) */
 
   /* ── 로그인 · 토스트 · 바닥글 ── */
   .login { margin: 32px auto; padding: 0 12px; }
