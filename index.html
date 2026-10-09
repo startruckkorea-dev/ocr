@@ -123,6 +123,69 @@ html, * { scrollbar-width: thin; scrollbar-color: #CBD5E1 transparent; }
 ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: #94A3B8; background-clip: padding-box; }
 </style>
+<style id="aps-mobile">
+/* APS 모바일(10-09 · aps-mobile) — 767px 이하 전용. 웹 화면 무변경 */
+/* OCR: 이미 모바일 대응(900 · 620px)이 있어 다듬기만. 620px 1열 규칙에서 .why(grid-column:2/4)가 암시적 열을 만들어
+   라벨이 세로로 쪼개지던 것 · 왼쪽 카드 sticky 가 1열에서 리뷰 카드를 덮던 것 · 품목 표 상품명 칸이 좁던 것을 고친다. */
+@media (max-width: 767px) {
+  /* ── 머리띠 · 바깥 여백 ── */
+  .top { padding: 12px; gap: 8px 10px; flex-wrap: wrap; }
+  .top > div:first-child { flex: 1 1 auto; min-width: 0; }
+  .top h1 { font-size: .98rem; }
+  .top p { font-size: .72rem; line-height: 1.45; }
+  .top .who { margin-left: auto; min-width: 0; overflow-wrap: anywhere; }
+  .top .btn { min-height: 34px; flex: none; }
+  .wrap { margin: 12px auto; padding: 0 12px; }
+  .grid { gap: 12px; grid-template-columns: minmax(0, 1fr); }
+  .card { padding: 14px; }
+  .sticky { position: relative; top: auto; }   /* 1열에서는 붙어 있지 않게 — 리뷰 카드를 덮지 않음 */
+
+  /* ── 단추 · 입력(글자 16px — iOS 자동 확대 방지) ── */
+  .btn { min-height: 40px; justify-content: center; }
+  .btn.sm { min-height: 34px; }
+  .drop { padding: 16px 12px; }
+  .drop .btns .btn { flex: 1 1 0; }
+  .fld input, table.items input, .login input { font-size: 16px; }
+
+  /* ── 리뷰 항목: 라벨 · 상태 한 줄, 입력 아래 꽉 채움, 경고 문구는 그 아래 ── */
+  .fld { grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; padding: 8px 2px; }
+  .fld label { grid-column: 1; grid-row: 1; }
+  .fld .st { grid-column: 2; grid-row: 1; }
+  .fld input { grid-column: 1 / -1; grid-row: 2; padding: 8px 10px; }
+  .fld .why { grid-column: 1 / -1; grid-row: 3; margin-top: 0; }
+  .ackbtn { min-height: 30px; padding: 4px 12px; }
+  .tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { flex: 0 0 auto; white-space: nowrap; min-height: 40px; }
+
+  /* 품목 표 — 고정 폭(92 · 58 · 100px)을 비율로 바꿔 상품명 칸을 넓힌다 */
+  table.items th:nth-child(2) { width: 22% !important; }
+  table.items th:nth-child(3) { width: 13% !important; }
+  table.items th:nth-child(4) { width: 24% !important; }
+  table.items th:nth-child(5) { width: 26px !important; }
+  table.items td { padding: 3px 2px; }
+  table.items input { padding: 7px 5px; }
+  .checks li { flex-wrap: wrap; row-gap: 2px; }
+
+  /* 확정 줄 — 안내 · 검산 확인은 위, 「다른 영수증」 · 「확정」 두 단추는 아래 줄 꽉 채움 */
+  .done { gap: 8px; }
+  .done .ackall, .done .need { order: -1; flex: 1 1 100%; margin-left: 0 !important; }
+  .done > .btn { flex: 1 1 0; min-height: 44px; }
+
+  /* ── 확정 목록 — 머리 단추 묶음은 아래 줄, 표는 상자 안 가로 스크롤 · 셀 줄바꿈 없음 ── */
+  .card h2 { flex-wrap: wrap; row-gap: 8px; }
+  .card h2 > span[style*="margin-left:auto"] { margin-left: 0 !important; flex: 1 1 100%; }
+  .card h2 > span[style*="margin-left:auto"] .btn { flex: 1 1 auto; white-space: nowrap; padding: 4px 8px; }
+  table.hist td { white-space: nowrap; }
+
+  /* ── 로그인 · 토스트 · 바닥글 ── */
+  .login { margin: 32px auto; padding: 0 12px; }
+  .login .card { padding: 26px 20px; }
+  #btnLogin { min-height: 44px; }
+  .toast { width: max-content; max-width: calc(100vw - 32px); text-align: center; bottom: 16px; }
+  footer { padding: 16px 12px 24px; line-height: 1.5; }
+}
+</style>
 </head>
 <body>
 <div class="top">
